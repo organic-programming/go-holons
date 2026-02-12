@@ -64,6 +64,8 @@ import "github.com/Organic-Programming/go-holons/pkg/transport"
 lis, err := transport.Listen("tcp://:9090")        // TCP socket
 lis, err := transport.Listen("unix:///tmp/h.sock")  // Unix domain socket
 lis, err := transport.Listen("stdio://")            // stdin/stdout pipe
+lis, err := transport.Listen("mem://")              // in-process bufconn
+lis, err := transport.Listen("ws://:8080")          // WebSocket
 
 // DefaultURI is "tcp://:9090".
 transport.DefaultURI
@@ -79,6 +81,9 @@ transport.Scheme("tcp://:9090") // → "tcp"
 | `tcp://<host>:<port>` | TCP socket, classic gRPC | Yes |
 | `stdio://` | stdin/stdout pipe, zero overhead | Yes |
 | `unix://<path>` | Unix domain socket, local IPC | Optional |
+| `mem://` | In-process bufconn, testing and composite holons | Optional |
+| `ws://<host>:<port>[/path]` | WebSocket, browser-accessible, NAT-friendly | Optional |
+| `wss://<host>:<port>[/path]` | WebSocket over TLS | Optional |
 
 ### stdio transport internals
 
@@ -92,6 +97,27 @@ The `stdio://` scheme wraps `os.Stdin` and `os.Stdout` as a single
 - **No buffering**: reads and writes go directly to the OS file descriptors.
 - **Graceful termination**: closing the connection or the listener signals
   `Accept()` to return `io.EOF`, which makes `grpc.Server.Serve()` exit.
+
+### mem transport
+
+The `mem://` scheme wraps `grpc/test/bufconn` — an in-memory pipe.
+The exported `MemListener` provides a `Dial()` method for client-side
+connections in the same process. Use cases:
+
+- **Unit testing**: no OS resources needed (no ports, no socket files)
+- **Composite holons**: multiple services in one binary calling each other
+  at memory speed (~1µs latency)
+
+### WebSocket transport
+
+The `ws://` scheme starts an HTTP server that upgrades WebSocket
+connections and presents them as `net.Conn` to the gRPC server. Uses
+`nhooyr.io/websocket` for a clean `net.Conn` wrapper via `websocket.NetConn`.
+
+- **Path**: defaults to `/grpc` if omitted (e.g. `ws://:8080` → `ws://:8080/grpc`)
+- **Browser access**: the only transport that browsers can use natively
+- **NAT traversal**: works through firewalls on port 80/443
+- **No proxy needed**: unlike gRPC-Web, this tunnels raw gRPC frames over WS
 
 ---
 
@@ -146,6 +172,8 @@ type RegisterFunc func(s *grpc.Server)
 | `--listen tcp://:8080` | Use the given transport URI |
 | `--listen unix:///tmp/h.sock` | Unix domain socket |
 | `--listen stdio://` | stdin/stdout pipe |
+| `--listen mem://` | in-process bufconn |
+| `--listen ws://:8080` | WebSocket |
 | `--port 8080` | Shorthand for `--listen tcp://:8080` |
 | *(none)* | Default: `tcp://:9090` |
 
@@ -171,6 +199,12 @@ conn, cmd, err := grpcclient.DialStdio(ctx, "/path/to/holon")
 defer cmd.Process.Kill()
 defer cmd.Wait()
 defer conn.Close()
+
+// DialMem connects to a MemListener in the same process.
+conn, err := grpcclient.DialMem(ctx, memListener)
+
+// DialWebSocket connects via WebSocket.
+conn, err := grpcclient.DialWebSocket(ctx, "ws://host:8080/grpc")
 ```
 
 ### DialStdio lifecycle
@@ -216,11 +250,12 @@ When creating a new Go holon:
 
 When modifying this SDK:
 
-1. **Keep it dependency-light**: only `google.golang.org/grpc` and stdlib.
+1. **Keep it dependency-light**: only `google.golang.org/grpc`,
+   `nhooyr.io/websocket`, and stdlib.
 2. **No domain logic**: this is plumbing, not policy.
 3. **No proto files**: this SDK has no contract of its own.
 4. **Test transports**: any change to `transport` must be verified with
-   all three schemes: TCP, Unix socket, stdio.
+   all five schemes: TCP, Unix, stdio, mem, WebSocket.
 
 ---
 
@@ -231,6 +266,6 @@ When modifying this SDK:
 | Article 2 (gRPC + reflection) | `serve.Run` enables reflection by default |
 | Article 11 (serve convention) | `serve.ParseFlags` + `serve.Run` |
 | Article 11 (mandatory transports) | `transport.Listen` supports `tcp://` and `stdio://` |
-| Article 11 (optional transports) | `transport.Listen` supports `unix://` |
+| Article 11 (optional transports) | `transport.Listen` supports `unix://`, `mem://`, `ws://`, `wss://` |
 | Article 11 (backward compat) | `serve.ParseFlags` accepts `--port` |
 | Article 11 (SIGTERM) | `serve.Run` installs signal handlers |
