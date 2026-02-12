@@ -246,3 +246,134 @@ func TestWebBridgeGoCallsBrowserError(t *testing.T) {
 		t.Errorf("code = %d, want 3", webErr.Code)
 	}
 }
+
+func TestWebBridgeInvalidJSON(t *testing.T) {
+	bridge := transport.NewWebBridge()
+	srv := httptest.NewServer(bridge)
+	defer srv.Close()
+
+	c := dialTestBridge(t, srv)
+	defer c.CloseNow()
+
+	ctx := context.Background()
+	if err := c.Write(ctx, websocket.MessageText, []byte(`{bad-json`)); err != nil {
+		t.Fatal(err)
+	}
+
+	_, data, err := c.Read(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var resp map[string]interface{}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		t.Fatal(err)
+	}
+
+	errObj, ok := resp["error"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected error object, got: %v", resp)
+	}
+	if errObj["code"].(float64) != 3 {
+		t.Fatalf("expected code=3 for invalid JSON, got: %v", errObj["code"])
+	}
+}
+
+func TestWebBridgeHeartbeatCompatibility(t *testing.T) {
+	bridge := transport.NewWebBridge()
+	srv := httptest.NewServer(bridge)
+	defer srv.Close()
+
+	c := dialTestBridge(t, srv)
+	defer c.CloseNow()
+
+	resp := roundTrip(t, c, `{"id":"h1","method":"holon-web/Heartbeat","payload":{}}`)
+	if resp["id"] != "h1" {
+		t.Fatalf("id = %v, want h1", resp["id"])
+	}
+	errObj, ok := resp["error"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected error envelope for unknown heartbeat method: %v", resp)
+	}
+	if errObj["code"].(float64) != 12 {
+		t.Fatalf("code = %v, want 12", errObj["code"])
+	}
+}
+
+func TestWebBridgeIgnoresUnknownAndDuplicateResponseIDs(t *testing.T) {
+	bridge := transport.NewWebBridge()
+
+	var conn *transport.WebConn
+	var connReady sync.WaitGroup
+	connReady.Add(1)
+	bridge.OnConnect(func(c *transport.WebConn) {
+		conn = c
+		connReady.Done()
+	})
+
+	srv := httptest.NewServer(bridge)
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	c := dialTestBridge(t, srv)
+	defer c.CloseNow()
+
+	// Browser behavior:
+	// 1) send an unknown response id (must be ignored by bridge)
+	// 2) send the expected response
+	// 3) send a duplicate response with the same id (must be ignored)
+	go func() {
+		for {
+			_, data, err := c.Read(ctx)
+			if err != nil {
+				return
+			}
+
+			var req map[string]interface{}
+			if err := json.Unmarshal(data, &req); err != nil {
+				continue
+			}
+
+			id, ok := req["id"].(string)
+			if !ok || id == "" {
+				continue
+			}
+			if _, ok := req["method"].(string); !ok {
+				continue
+			}
+
+			unknownResp, _ := json.Marshal(map[string]interface{}{
+				"id":     "unknown-" + id,
+				"result": map[string]bool{"ignored": true},
+			})
+			c.Write(ctx, websocket.MessageText, unknownResp)
+
+			mainResp, _ := json.Marshal(map[string]interface{}{
+				"id":     id,
+				"result": map[string]string{"echoId": id},
+			})
+			c.Write(ctx, websocket.MessageText, mainResp)
+			c.Write(ctx, websocket.MessageText, mainResp)
+		}
+	}()
+
+	connReady.Wait()
+
+	for i := 0; i < 2; i++ {
+		payload, _ := json.Marshal(map[string]string{})
+		result, err := conn.InvokeWithTimeout("ui.v1.UIService/GetViewport", payload, 2*time.Second)
+		if err != nil {
+			t.Fatalf("invoke %d failed: %v", i+1, err)
+		}
+
+		var out map[string]string
+		if err := json.Unmarshal(result, &out); err != nil {
+			t.Fatalf("unmarshal invoke %d result: %v", i+1, err)
+		}
+		if out["echoId"] == "" {
+			t.Fatalf("invoke %d returned empty echoId: %v", i+1, out)
+		}
+	}
+}
