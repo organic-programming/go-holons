@@ -6,6 +6,9 @@
 //   - tcp://<host>:<port>  — TCP socket (default: tcp://:9090)
 //   - unix://<path>        — Unix domain socket
 //   - stdio://             — stdin/stdout pipe (single connection)
+//   - mem://               — in-process bufconn (testing, composite holons)
+//   - ws://<host>:<port>   — WebSocket (browser, NAT traversal)
+//   - wss://<host>:<port>  — WebSocket over TLS
 package transport
 
 import (
@@ -38,8 +41,14 @@ func Listen(uri string) (net.Listener, error) {
 	case uri == "stdio://" || uri == "stdio":
 		return newStdioListener(), nil
 
+	case strings.HasPrefix(uri, "mem://"):
+		return NewMemListener(), nil
+
+	case strings.HasPrefix(uri, "ws://") || strings.HasPrefix(uri, "wss://"):
+		return newWSListener(uri)
+
 	default:
-		return nil, fmt.Errorf("unsupported transport URI: %q (expected tcp://, unix://, or stdio://)", uri)
+		return nil, fmt.Errorf("unsupported transport URI: %q (expected tcp://, unix://, stdio://, mem://, or ws://)", uri)
 	}
 }
 

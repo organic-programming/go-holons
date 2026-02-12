@@ -2,7 +2,10 @@ module github.com/Organic-Programming/go-holons
 
 go 1.24.0
 
-require google.golang.org/grpc v1.78.0
+require (
+	google.golang.org/grpc v1.78.0
+	nhooyr.io/websocket v1.8.17
+)
 
 require (
 	golang.org/x/net v0.47.0 // indirect
