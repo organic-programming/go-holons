@@ -36,8 +36,11 @@ func newWSListener(uri string) (net.Listener, error) {
 		return nil, fmt.Errorf("ws listen %s: %w", addr, err)
 	}
 
+	// Use the actual bound address (resolves :0 → actual port)
+	boundAddr := tcpLis.Addr().String()
+
 	wsl := &wsListener{
-		addr:   addr,
+		addr:   boundAddr,
 		path:   path,
 		isTLS:  isTLS,
 		connCh: make(chan net.Conn, 16),
