@@ -1,0 +1,236 @@
+---
+# Cartouche v1
+title: "go-holons — Go SDK for Organic Programming"
+author:
+  name: "B. ALTER & Claude"
+  copyright: "© 2026 Benoit Pereira da Silva"
+created: 2026-02-12
+revised: 2026-02-12
+lang: en-US
+origin_lang: en-US
+translation_of: null
+translator: null
+access:
+  humans: true
+  agents: true
+status: draft
+---
+
+# go-holons — Go SDK for Organic Programming
+
+`go-holons` is **not a holon**. It is a Go module that provides reference
+implementations of the plumbing required by Constitution Article 11
+(The Serve Convention). Holons import it; it does not run on its own.
+
+**Import path**: `github.com/Organic-Programming/go-holons/pkg/<package>`
+
+---
+
+## 1. Architecture
+
+```
+sdk/go-holons/
+├── AGENT.md           ← you are here
+├── README.md
+├── go.mod / go.sum
+└── pkg/
+    ├── transport/     ← URI → net.Listener factory
+    ├── serve/         ← standard serve command
+    └── grpcclient/    ← transport-agnostic gRPC client
+```
+
+The three packages map to the three phases of inter-holon communication:
+
+| Phase | Package | Who uses it |
+|-------|---------|-------------|
+| **Listen** | `transport` | The holon server |
+| **Serve** | `serve` | The holon's `serve` subcommand |
+| **Dial** | `grpcclient` | The holon client (or OP) |
+
+---
+
+## 2. `pkg/transport` — URI-based listener factory
+
+Parses a transport URI and returns a `net.Listener`. This is the
+lowest-level building block — use it directly only if `pkg/serve` does
+not fit your needs.
+
+### API
+
+```go
+import "github.com/Organic-Programming/go-holons/pkg/transport"
+
+// Listen creates a net.Listener from a transport URI.
+lis, err := transport.Listen("tcp://:9090")        // TCP socket
+lis, err := transport.Listen("unix:///tmp/h.sock")  // Unix domain socket
+lis, err := transport.Listen("stdio://")            // stdin/stdout pipe
+
+// DefaultURI is "tcp://:9090".
+transport.DefaultURI
+
+// Scheme extracts the scheme name for logging.
+transport.Scheme("tcp://:9090") // → "tcp"
+```
+
+### Supported URI schemes
+
+| Scheme | Description | Mandatory |
+|--------|-------------|-----------|
+| `tcp://<host>:<port>` | TCP socket, classic gRPC | Yes |
+| `stdio://` | stdin/stdout pipe, zero overhead | Yes |
+| `unix://<path>` | Unix domain socket, local IPC | Optional |
+
+### stdio transport internals
+
+The `stdio://` scheme wraps `os.Stdin` and `os.Stdout` as a single
+`net.Conn` delivered through a `net.Listener`. Key design choices:
+
+- **Single connection**: `Accept()` returns exactly one connection, then
+  blocks on a `done` channel until the listener is closed. This prevents
+  the deadlock that would occur if gRPC's `Serve()` loop called `Accept()`
+  a second time on an empty channel.
+- **No buffering**: reads and writes go directly to the OS file descriptors.
+- **Graceful termination**: closing the connection or the listener signals
+  `Accept()` to return `io.EOF`, which makes `grpc.Server.Serve()` exit.
+
+---
+
+## 3. `pkg/serve` — standard serve command
+
+High-level helper implementing the full `serve` lifecycle. A holon needs
+three lines to be fully compliant with Article 11:
+
+```go
+import "github.com/Organic-Programming/go-holons/pkg/serve"
+
+case "serve":
+    listenURI := serve.ParseFlags(os.Args[2:])
+    if err := serve.Run(listenURI, func(s *grpc.Server) {
+        pb.RegisterMyServiceServer(s, &myServer{})
+    }); err != nil {
+        log.Fatal(err)
+    }
+```
+
+### API
+
+```go
+// ParseFlags extracts --listen <URI> or --port <port> from args.
+// Returns transport.DefaultURI if neither is present.
+func ParseFlags(args []string) string
+
+// Run starts a gRPC server with reflection ON and graceful shutdown.
+func Run(listenURI string, register RegisterFunc) error
+
+// RunWithOptions allows disabling reflection (for production/exposed).
+func RunWithOptions(listenURI string, register RegisterFunc, reflect bool) error
+
+// RegisterFunc is called to register services on the gRPC server.
+type RegisterFunc func(s *grpc.Server)
+```
+
+### What `Run` does
+
+1. Calls `transport.Listen(listenURI)` to create the listener.
+2. Creates a `grpc.Server`.
+3. Calls your `RegisterFunc` to register services.
+4. Enables gRPC reflection (Article 2 mandate).
+5. Installs signal handlers for `SIGTERM` and `SIGINT` → `GracefulStop()`.
+6. Logs the transport and mode.
+7. Calls `s.Serve(lis)` — blocks until shutdown.
+
+### Flag parsing
+
+| Flag | Effect |
+|------|--------|
+| `--listen tcp://:8080` | Use the given transport URI |
+| `--listen unix:///tmp/h.sock` | Unix domain socket |
+| `--listen stdio://` | stdin/stdout pipe |
+| `--port 8080` | Shorthand for `--listen tcp://:8080` |
+| *(none)* | Default: `tcp://:9090` |
+
+---
+
+## 4. `pkg/grpcclient` — transport-agnostic gRPC client
+
+Client-side helpers for connecting to holons via any transport.
+
+### API
+
+```go
+import "github.com/Organic-Programming/go-holons/pkg/grpcclient"
+
+// Dial connects to an existing gRPC server.
+conn, err := grpcclient.Dial(ctx, "localhost:9090")        // TCP
+conn, err := grpcclient.Dial(ctx, "unix:///tmp/h.sock")    // Unix socket
+
+// DialStdio launches a holon binary with `serve --listen stdio://`
+// and returns a gRPC connection backed by stdin/stdout pipes.
+// The caller must close the connection AND kill the process.
+conn, cmd, err := grpcclient.DialStdio(ctx, "/path/to/holon")
+defer cmd.Process.Kill()
+defer cmd.Wait()
+defer conn.Close()
+```
+
+### DialStdio lifecycle
+
+`DialStdio` is the purest form of inter-holon communication — no port,
+no socket file, no network stack. Inspired by LSP.
+
+1. Launch: `exec.CommandContext(ctx, binary, "serve", "--listen", "stdio://")`
+2. Capture `cmd.StdinPipe()` (parent writes → child reads) and
+   `cmd.StdoutPipe()` (child writes → parent reads).
+3. **Readiness probe**: read the first byte from stdout to confirm
+   the server's HTTP/2 SETTINGS frame. Prepend it back via `io.MultiReader`.
+4. Wrap the pipes as a `net.Conn` (`pipeConn`).
+5. `grpc.DialContext` with `passthrough:///` (skip DNS) + `WithBlock`
+   (force immediate HTTP/2 handshake) + `WithContextDialer` (single-use dialer).
+6. Return `(conn, cmd, nil)`.
+
+The caller owns the process lifecycle. This is intentional — it allows
+both ephemeral (call and kill) and long-running (reuse connection) patterns.
+
+### Implementation details
+
+- **`passthrough:///`**: gRPC's default name resolver tries DNS lookup.
+  `passthrough` bypasses this for non-network targets.
+- **`WithBlock()`**: `grpc.NewClient` defers connection establishment.
+  For pipes, we need the HTTP/2 handshake to happen immediately.
+- **Single-use dialer**: `sync.Once` ensures the pipe-backed `net.Conn`
+  is returned exactly once. gRPC may call the dialer multiple times for
+  reconnection; subsequent calls return an error.
+
+---
+
+## 5. Agent directives
+
+When creating a new Go holon:
+
+1. **Import `pkg/serve`** for the `serve` subcommand. Do not reimplement
+   flag parsing, listener creation, or signal handling.
+2. **Import `pkg/transport`** only if you need low-level listener access
+   (e.g., custom gRPC server options).
+3. **Import `pkg/grpcclient`** when a holon needs to call another holon.
+4. **Never duplicate** the transport or stdio plumbing — import this SDK.
+
+When modifying this SDK:
+
+1. **Keep it dependency-light**: only `google.golang.org/grpc` and stdlib.
+2. **No domain logic**: this is plumbing, not policy.
+3. **No proto files**: this SDK has no contract of its own.
+4. **Test transports**: any change to `transport` must be verified with
+   all three schemes: TCP, Unix socket, stdio.
+
+---
+
+## 6. Relationship to the Constitution
+
+| Article | SDK implementation |
+|---------|-------------------|
+| Article 2 (gRPC + reflection) | `serve.Run` enables reflection by default |
+| Article 11 (serve convention) | `serve.ParseFlags` + `serve.Run` |
+| Article 11 (mandatory transports) | `transport.Listen` supports `tcp://` and `stdio://` |
+| Article 11 (optional transports) | `transport.Listen` supports `unix://` |
+| Article 11 (backward compat) | `serve.ParseFlags` accepts `--port` |
+| Article 11 (SIGTERM) | `serve.Run` installs signal handlers |
