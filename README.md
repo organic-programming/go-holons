@@ -1,3 +1,20 @@
+---
+# Cartouche v1
+title: "go-holons — Go SDK for Organic Programming"
+author:
+  name: "B. ALTER"
+  copyright: "© 2026 Benoit Pereira da Silva"
+created: 2026-02-12
+revised: 2026-02-12
+lang: en-US
+origin_lang: en-US
+translation_of: null
+translator: null
+access:
+  humans: true
+  agents: false
+status: draft
+---
 # go-holons
 
 **Go SDK for Organic Programming** — reference implementations of the
