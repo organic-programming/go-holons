@@ -29,6 +29,7 @@ This is **not** a holon. It is a library. Holons import it.
 | `transport` | `go-holons/pkg/transport` | URI → `net.Listener` factory |
 | `serve` | `go-holons/pkg/serve` | Standard `serve` command |
 | `grpcclient` | `go-holons/pkg/grpcclient` | Transport-agnostic gRPC client |
+| `holonrpc` | `go-holons/pkg/holonrpc` | Holon-RPC client + server (JSON-RPC 2.0 over WebSocket) |
 
 ## Transports
 
@@ -52,7 +53,7 @@ translates JSON ↔ handler calls entirely in-process.
 ┌──────────────┐   WebSocket       ┌──────────────────────────────────┐
 │  Browser     │  ws://:8080/ws    │  Go Holon                        │
 │  js-web-     │ ◄──────────────►  │  ┌──────────┐   ┌─────────────┐ │
-│  holons      │  holon-web proto  │  │ WebBridge │   │ gRPC server │ │
+│  holons      │  holon-rpc proto  │  │ WebBridge │   │ gRPC server │ │
 │  (client)    │                   │  │ (JSON/WS) │   │ (standard)  │ │
 └──────────────┘                   │  └──────────┘   └─────────────┘ │
                                    └──────────────────────────────────┘
@@ -64,9 +65,9 @@ translates JSON ↔ handler calls entirely in-process.
 bridge := transport.NewWebBridge()
 
 bridge.Register("hello.v1.HelloService/Greet",
-    func(ctx context.Context, payload json.RawMessage) (json.RawMessage, error) {
+    func(ctx context.Context, params json.RawMessage) (json.RawMessage, error) {
         var req struct { Name string `json:"name"` }
-        json.Unmarshal(payload, &req)
+        json.Unmarshal(params, &req)
         return json.Marshal(map[string]string{"message": "Hello, " + req.Name + "!"})
     },
 )
@@ -80,8 +81,8 @@ http.ListenAndServe(":8080", mux)
 
 | Direction | Format |
 |-----------|--------|
-| Browser → Server | `{ "id": "1", "method": "pkg.Service/Method", "payload": {...} }` |
-| Server → Browser (success) | `{ "id": "1", "result": {...} }` |
-| Server → Browser (error) | `{ "id": "1", "error": { "code": 12, "message": "..." } }` |
+| Browser → Server | `{ "jsonrpc":"2.0", "id":"1", "method":"pkg.Service/Method", "params": {...} }` |
+| Server → Browser (success) | `{ "jsonrpc":"2.0", "id":"1", "result": {...} }` |
+| Server → Browser (error) | `{ "jsonrpc":"2.0", "id":"1", "error": { "code": 12, "message": "..." } }` |
 
 See [AGENT.md](./AGENT.md) for full documentation.

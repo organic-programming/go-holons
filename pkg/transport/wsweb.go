@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -13,7 +14,8 @@ import (
 	"nhooyr.io/websocket"
 )
 
-// WebBridge provides a bidirectional JSON-over-WebSocket gateway.
+// WebBridge provides a bidirectional Holon-RPC gateway
+// (JSON-RPC 2.0 over WebSocket).
 //
 // Both sides can act as client and server simultaneously:
 //   - Browser calls Go:  browser sends a request, Go handler responds.
@@ -21,9 +23,9 @@ import (
 //
 // Wire protocol (symmetric — either direction):
 //
-//	Request:  { "id": "1", "method": "pkg.Service/Method", "payload": {...} }
-//	Response: { "id": "1", "result": {...} }
-//	Error:    { "id": "1", "error": { "code": 5, "message": "..." } }
+//	Request:  { "jsonrpc":"2.0", "id":"1", "method":"pkg.Service/Method", "params":{...} }
+//	Response: { "jsonrpc":"2.0", "id":"1", "result":{...} }
+//	Error:    { "jsonrpc":"2.0", "id":"1", "error":{"code":5, "message":"..."} }
 //
 // A message is a request if it has "method". A message is a response if
 // it has "result" or "error". The "id" field correlates responses to requests.
@@ -35,9 +37,9 @@ type WebBridge struct {
 	onConnect func(*WebConn) // called when a browser connects
 }
 
-// WebHandler processes a single RPC call. It receives the JSON payload
+// WebHandler processes a single RPC call. It receives the JSON params
 // and returns the JSON result or an error.
-type WebHandler func(ctx context.Context, payload json.RawMessage) (json.RawMessage, error)
+type WebHandler func(ctx context.Context, params json.RawMessage) (json.RawMessage, error)
 
 // WebError is returned by handlers to communicate a specific error code.
 type WebError struct {
@@ -119,7 +121,7 @@ func (b *WebBridge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // bidirectional message loop until the client disconnects.
 func (b *WebBridge) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	opts := &websocket.AcceptOptions{
-		Subprotocols: []string{"holon-web"},
+		Subprotocols: []string{"holon-rpc"},
 	}
 
 	b.mu.RLock()
@@ -172,7 +174,10 @@ func (b *WebBridge) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 		var msg wsMsg
 		if err := json.Unmarshal(data, &msg); err != nil {
-			resp := marshalWsResp(wsMsg{Error: &wsErr{Code: 3, Message: "invalid JSON"}})
+			resp := marshalWsResp(wsMsg{
+				JSONRPC: "2.0",
+				Error:   &wsErr{Code: -32700, Message: "parse error"},
+			})
 			c.Write(ctx, websocket.MessageText, resp)
 			continue
 		}
@@ -201,7 +206,12 @@ func (c *WebConn) Invoke(ctx context.Context, method string, payload json.RawMes
 	defer c.pending.Delete(id)
 
 	// Send request to browser
-	reqData, err := json.Marshal(wsMsg{ID: id, Method: method, Payload: payload})
+	reqData, err := json.Marshal(wsMsg{
+		JSONRPC: "2.0",
+		ID:      id,
+		Method:  method,
+		Params:  payload,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("wsweb: marshal request: %w", err)
 	}
@@ -239,9 +249,10 @@ func (c *WebConn) InvokeWithTimeout(method string, payload json.RawMessage, time
 // wsMsg is the unified wire envelope. If Method is set, it's a request.
 // If Result or Error is set, it's a response.
 type wsMsg struct {
-	ID      string          `json:"id"`
+	JSONRPC string          `json:"jsonrpc,omitempty"`
+	ID      string          `json:"id,omitempty"`
 	Method  string          `json:"method,omitempty"`
-	Payload json.RawMessage `json:"payload,omitempty"`
+	Params  json.RawMessage `json:"params,omitempty"`
 	Result  json.RawMessage `json:"result,omitempty"`
 	Error   *wsErr          `json:"error,omitempty"`
 }
@@ -253,22 +264,56 @@ type wsErr struct {
 
 // handleRequest dispatches an incoming browser request to a Go handler.
 func (b *WebBridge) handleRequest(ctx context.Context, conn *WebConn, msg wsMsg) {
+	isNotification := strings.TrimSpace(msg.ID) == ""
+
 	b.mu.RLock()
 	handler, ok := b.handlers[msg.Method]
 	b.mu.RUnlock()
 
-	var resp wsMsg
-	resp.ID = msg.ID
+	resp := wsMsg{
+		JSONRPC: "2.0",
+		ID:      msg.ID,
+	}
+
+	if msg.JSONRPC != "2.0" {
+		if isNotification {
+			return
+		}
+		resp.Error = &wsErr{Code: -32600, Message: "invalid request"}
+		data := marshalWsResp(resp)
+		conn.mu.Lock()
+		conn.ws.Write(ctx, websocket.MessageText, data)
+		conn.mu.Unlock()
+		return
+	}
+
+	if msg.Method == "rpc.heartbeat" {
+		if isNotification {
+			return
+		}
+		resp.Result = json.RawMessage("{}")
+		data := marshalWsResp(resp)
+		conn.mu.Lock()
+		conn.ws.Write(ctx, websocket.MessageText, data)
+		conn.mu.Unlock()
+		return
+	}
 
 	if !ok {
+		if isNotification {
+			return
+		}
 		resp.Error = &wsErr{Code: 12, Message: fmt.Sprintf("method %q not registered", msg.Method)}
 	} else {
-		payload := msg.Payload
-		if payload == nil {
-			payload = json.RawMessage("{}")
+		params := msg.Params
+		if params == nil {
+			params = json.RawMessage("{}")
 		}
-		result, err := handler(ctx, payload)
+		result, err := handler(ctx, params)
 		if err != nil {
+			if isNotification {
+				return
+			}
 			code := 13
 			errMsg := err.Error()
 			if we, ok := err.(*WebError); ok {
@@ -277,6 +322,9 @@ func (b *WebBridge) handleRequest(ctx context.Context, conn *WebConn, msg wsMsg)
 			}
 			resp.Error = &wsErr{Code: code, Message: errMsg}
 		} else {
+			if isNotification {
+				return
+			}
 			resp.Result = result
 		}
 	}
@@ -289,6 +337,11 @@ func (b *WebBridge) handleRequest(ctx context.Context, conn *WebConn, msg wsMsg)
 
 // handleResponse routes an incoming browser response to the pending Invoke().
 func (c *WebConn) handleResponse(msg wsMsg) {
+	if msg.JSONRPC != "2.0" {
+		msg.Error = &wsErr{Code: -32600, Message: "invalid response"}
+		msg.Result = nil
+	}
+
 	val, ok := c.pending.Load(msg.ID)
 	if !ok {
 		return // stale or unknown id
@@ -304,7 +357,7 @@ func marshalWsResp(r wsMsg) []byte {
 	data, err := json.Marshal(r)
 	if err != nil {
 		log.Printf("wsweb: marshal response: %v", err)
-		return []byte(`{"error":{"code":13,"message":"internal marshal error"}}`)
+		return []byte(`{"jsonrpc":"2.0","error":{"code":13,"message":"internal marshal error"}}`)
 	}
 	return data
 }

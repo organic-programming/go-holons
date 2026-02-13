@@ -22,7 +22,7 @@ func dialTestBridge(t *testing.T, srv *httptest.Server) *websocket.Conn {
 	ctx := context.Background()
 	wsURL := "ws" + srv.URL[4:]
 	c, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
-		Subprotocols: []string{"holon-web"},
+		Subprotocols: []string{"holon-rpc"},
 	})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
@@ -44,6 +44,9 @@ func roundTrip(t *testing.T, c *websocket.Conn, req string) map[string]interface
 	var resp map[string]interface{}
 	if err := json.Unmarshal(data, &resp); err != nil {
 		t.Fatal(err)
+	}
+	if got := resp["jsonrpc"]; got != "2.0" {
+		t.Fatalf("jsonrpc = %v, want 2.0", got)
 	}
 	return resp
 }
@@ -70,7 +73,7 @@ func TestWebBridgeRoundTrip(t *testing.T) {
 	c := dialTestBridge(t, srv)
 	defer c.CloseNow()
 
-	resp := roundTrip(t, c, `{"id":"1","method":"hello.v1.HelloService/Greet","payload":{"name":"Alice"}}`)
+	resp := roundTrip(t, c, `{"jsonrpc":"2.0","id":"1","method":"hello.v1.HelloService/Greet","params":{"name":"Alice"}}`)
 	if resp["id"] != "1" {
 		t.Errorf("id = %v", resp["id"])
 	}
@@ -98,7 +101,7 @@ func TestWebBridgeDefaultName(t *testing.T) {
 	c := dialTestBridge(t, srv)
 	defer c.CloseNow()
 
-	resp := roundTrip(t, c, `{"id":"2","method":"hello.v1.HelloService/Greet","payload":{}}`)
+	resp := roundTrip(t, c, `{"jsonrpc":"2.0","id":"2","method":"hello.v1.HelloService/Greet","params":{}}`)
 	result := resp["result"].(map[string]interface{})
 	if result["message"] != "Hello, World!" {
 		t.Errorf("message = %v", result["message"])
@@ -113,7 +116,7 @@ func TestWebBridgeMethodNotFound(t *testing.T) {
 	c := dialTestBridge(t, srv)
 	defer c.CloseNow()
 
-	resp := roundTrip(t, c, `{"id":"3","method":"no.Such/Method"}`)
+	resp := roundTrip(t, c, `{"jsonrpc":"2.0","id":"3","method":"no.Such/Method"}`)
 	errObj := resp["error"].(map[string]interface{})
 	if errObj["code"].(float64) != 12 {
 		t.Errorf("code = %v", errObj["code"])
@@ -166,8 +169,9 @@ func TestWebBridgeGoCallsBrowser(t *testing.T) {
 
 			if method, ok := msg["method"].(string); ok && method == "ui.v1.UIService/GetViewport" {
 				resp, _ := json.Marshal(map[string]interface{}{
-					"id":     msg["id"],
-					"result": map[string]int{"width": 1920, "height": 1080},
+					"jsonrpc": "2.0",
+					"id":      msg["id"],
+					"result":  map[string]int{"width": 1920, "height": 1080},
 				})
 				c.Write(ctx, websocket.MessageText, resp)
 			}
@@ -225,8 +229,9 @@ func TestWebBridgeGoCallsBrowserError(t *testing.T) {
 
 			if _, ok := msg["method"]; ok {
 				resp, _ := json.Marshal(map[string]interface{}{
-					"id":    msg["id"],
-					"error": map[string]interface{}{"code": 3, "message": "not supported"},
+					"jsonrpc": "2.0",
+					"id":      msg["id"],
+					"error":   map[string]interface{}{"code": 3, "message": "not supported"},
 				})
 				c.Write(ctx, websocket.MessageText, resp)
 			}
@@ -271,13 +276,16 @@ func TestWebBridgeInvalidJSON(t *testing.T) {
 	if err := json.Unmarshal(data, &resp); err != nil {
 		t.Fatal(err)
 	}
+	if got := resp["jsonrpc"]; got != "2.0" {
+		t.Fatalf("jsonrpc = %v, want 2.0", got)
+	}
 
 	errObj, ok := resp["error"].(map[string]interface{})
 	if !ok {
 		t.Fatalf("expected error object, got: %v", resp)
 	}
-	if errObj["code"].(float64) != 3 {
-		t.Fatalf("expected code=3 for invalid JSON, got: %v", errObj["code"])
+	if errObj["code"].(float64) != -32700 {
+		t.Fatalf("expected code=-32700 for invalid JSON, got: %v", errObj["code"])
 	}
 }
 
@@ -289,16 +297,16 @@ func TestWebBridgeHeartbeatCompatibility(t *testing.T) {
 	c := dialTestBridge(t, srv)
 	defer c.CloseNow()
 
-	resp := roundTrip(t, c, `{"id":"h1","method":"holon-web/Heartbeat","payload":{}}`)
+	resp := roundTrip(t, c, `{"jsonrpc":"2.0","id":"h1","method":"rpc.heartbeat","params":{}}`)
 	if resp["id"] != "h1" {
 		t.Fatalf("id = %v, want h1", resp["id"])
 	}
-	errObj, ok := resp["error"].(map[string]interface{})
+	result, ok := resp["result"].(map[string]interface{})
 	if !ok {
-		t.Fatalf("expected error envelope for unknown heartbeat method: %v", resp)
+		t.Fatalf("expected success envelope for rpc.heartbeat: %v", resp)
 	}
-	if errObj["code"].(float64) != 12 {
-		t.Fatalf("code = %v, want 12", errObj["code"])
+	if len(result) != 0 {
+		t.Fatalf("heartbeat result = %v, want {}", result)
 	}
 }
 
@@ -347,14 +355,16 @@ func TestWebBridgeIgnoresUnknownAndDuplicateResponseIDs(t *testing.T) {
 			}
 
 			unknownResp, _ := json.Marshal(map[string]interface{}{
-				"id":     "unknown-" + id,
-				"result": map[string]bool{"ignored": true},
+				"jsonrpc": "2.0",
+				"id":      "unknown-" + id,
+				"result":  map[string]bool{"ignored": true},
 			})
 			c.Write(ctx, websocket.MessageText, unknownResp)
 
 			mainResp, _ := json.Marshal(map[string]interface{}{
-				"id":     id,
-				"result": map[string]string{"echoId": id},
+				"jsonrpc": "2.0",
+				"id":      id,
+				"result":  map[string]string{"echoId": id},
 			})
 			c.Write(ctx, websocket.MessageText, mainResp)
 			c.Write(ctx, websocket.MessageText, mainResp)
@@ -422,8 +432,9 @@ func TestWebBridgeConcurrentInvokeMultipleClients(t *testing.T) {
 				}
 
 				resp, _ := json.Marshal(map[string]interface{}{
-					"id":     reqID,
-					"result": map[string]int{"client": id},
+					"jsonrpc": "2.0",
+					"id":      reqID,
+					"result":  map[string]int{"client": id},
 				})
 				_ = conn.Write(ctx, websocket.MessageText, resp)
 			}
@@ -556,16 +567,16 @@ func TestWebBridgeMalformedJSONPayloads(t *testing.T) {
 		{
 			name:     "invalid-json-document",
 			message:  `{bad-json`,
-			wantCode: 3,
+			wantCode: -32700,
 		},
 		{
 			name:     "invalid-envelope-field-type",
-			message:  `{"id":"e1","method":123,"payload":{}}`,
-			wantCode: 3,
+			message:  `{"jsonrpc":"2.0","id":"e1","method":123,"params":{}}`,
+			wantCode: -32700,
 		},
 		{
 			name:     "malformed-handler-payload-shape",
-			message:  `{"id":"e2","method":"hello.v1.HelloService/Greet","payload":"not-an-object"}`,
+			message:  `{"jsonrpc":"2.0","id":"e2","method":"hello.v1.HelloService/Greet","params":"not-an-object"}`,
 			wantCode: 3,
 		},
 	}
@@ -586,6 +597,9 @@ func TestWebBridgeMalformedJSONPayloads(t *testing.T) {
 			var resp map[string]interface{}
 			if err := json.Unmarshal(data, &resp); err != nil {
 				t.Fatalf("unmarshal response: %v", err)
+			}
+			if got := resp["jsonrpc"]; got != "2.0" {
+				t.Fatalf("jsonrpc = %v, want 2.0", got)
 			}
 
 			errObj, ok := resp["error"].(map[string]interface{})
@@ -610,7 +624,7 @@ func TestWebBridgeAllowOrigins(t *testing.T) {
 	wsURL := "ws" + srv.URL[4:]
 
 	_, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
-		Subprotocols: []string{"holon-web"},
+		Subprotocols: []string{"holon-rpc"},
 		HTTPHeader:   http.Header{"Origin": []string{"blocked.example"}},
 	})
 	if err == nil {
@@ -619,7 +633,7 @@ func TestWebBridgeAllowOrigins(t *testing.T) {
 
 	bridge.AllowOrigins()
 	openConn, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
-		Subprotocols: []string{"holon-web"},
+		Subprotocols: []string{"holon-rpc"},
 	})
 	if err != nil {
 		t.Fatalf("dial with unrestricted origins: %v", err)
@@ -640,7 +654,7 @@ func TestWebBridgeMarshalResponseFailure(t *testing.T) {
 	c := dialTestBridge(t, srv)
 	defer c.CloseNow()
 
-	resp := roundTrip(t, c, `{"id":"m1","method":"bad.v1.Service/Method","payload":{}}`)
+	resp := roundTrip(t, c, `{"jsonrpc":"2.0","id":"m1","method":"bad.v1.Service/Method","params":{}}`)
 	errObj, ok := resp["error"].(map[string]interface{})
 	if !ok {
 		t.Fatalf("expected error response, got: %v", resp)
