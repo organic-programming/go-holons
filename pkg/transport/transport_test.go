@@ -2,7 +2,6 @@ package transport_test
 
 import (
 	"context"
-	"fmt"
 	"net"
 	"testing"
 	"time"
@@ -78,12 +77,9 @@ func TestWSListenViaURI(t *testing.T) {
 }
 
 func TestWSListenerRoundTrip(t *testing.T) {
-	// Use a fixed port for the test
-	port := 19876
-	uri := fmt.Sprintf("ws://127.0.0.1:%d", port)
-	lis, err := transport.Listen(uri)
+	lis, err := transport.Listen("ws://127.0.0.1:0")
 	if err != nil {
-		t.Fatalf("listen %s: %v", uri, err)
+		t.Fatalf("listen ws://127.0.0.1:0: %v", err)
 	}
 	defer lis.Close()
 
@@ -104,7 +100,7 @@ func TestWSListenerRoundTrip(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	wsURL := fmt.Sprintf("ws://127.0.0.1:%d/grpc", port)
+	wsURL := lis.Addr().String()
 	c, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
 		Subprotocols: []string{"grpc"},
 	})

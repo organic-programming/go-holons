@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -375,5 +377,275 @@ func TestWebBridgeIgnoresUnknownAndDuplicateResponseIDs(t *testing.T) {
 		if out["echoId"] == "" {
 			t.Fatalf("invoke %d returned empty echoId: %v", i+1, out)
 		}
+	}
+}
+
+func TestWebBridgeConcurrentInvokeMultipleClients(t *testing.T) {
+	bridge := transport.NewWebBridge()
+
+	const clientCount = 4
+	connCh := make(chan *transport.WebConn, clientCount)
+	bridge.OnConnect(func(c *transport.WebConn) {
+		connCh <- c
+	})
+
+	srv := httptest.NewServer(bridge)
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	browserConns := make([]*websocket.Conn, 0, clientCount)
+	for i := 0; i < clientCount; i++ {
+		c := dialTestBridge(t, srv)
+		browserConns = append(browserConns, c)
+
+		clientID := i
+		go func(conn *websocket.Conn, id int) {
+			for {
+				_, data, err := conn.Read(ctx)
+				if err != nil {
+					return
+				}
+
+				var req map[string]interface{}
+				if err := json.Unmarshal(data, &req); err != nil {
+					continue
+				}
+
+				reqID, _ := req["id"].(string)
+				if reqID == "" {
+					continue
+				}
+				if _, ok := req["method"].(string); !ok {
+					continue
+				}
+
+				resp, _ := json.Marshal(map[string]interface{}{
+					"id":     reqID,
+					"result": map[string]int{"client": id},
+				})
+				_ = conn.Write(ctx, websocket.MessageText, resp)
+			}
+		}(c, clientID)
+	}
+	defer func() {
+		for _, c := range browserConns {
+			c.CloseNow()
+		}
+	}()
+
+	webConns := make([]*transport.WebConn, 0, clientCount)
+	for i := 0; i < clientCount; i++ {
+		select {
+		case wc := <-connCh:
+			webConns = append(webConns, wc)
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for connection %d", i+1)
+		}
+	}
+
+	type invokeResult struct {
+		client int
+		got    int
+		err    error
+	}
+	results := make(chan invokeResult, clientCount)
+
+	var wg sync.WaitGroup
+	for i, wc := range webConns {
+		wg.Add(1)
+		go func(client int, conn *transport.WebConn) {
+			defer wg.Done()
+
+			payload, _ := json.Marshal(map[string]int{"requestClient": client})
+			out, err := conn.InvokeWithTimeout("ui.v1.UIService/GetViewport", payload, 2*time.Second)
+			if err != nil {
+				results <- invokeResult{client: client, err: err}
+				return
+			}
+
+			var body map[string]int
+			if err := json.Unmarshal(out, &body); err != nil {
+				results <- invokeResult{client: client, err: err}
+				return
+			}
+			results <- invokeResult{client: client, got: body["client"]}
+		}(i, wc)
+	}
+	wg.Wait()
+	close(results)
+
+	seen := make(map[int]bool, clientCount)
+	for r := range results {
+		if r.err != nil {
+			t.Fatalf("invoke for client %d failed: %v", r.client, r.err)
+		}
+		seen[r.got] = true
+	}
+
+	if len(seen) != clientCount {
+		t.Fatalf("expected responses from %d distinct clients, got %d", clientCount, len(seen))
+	}
+}
+
+func TestWebBridgeInvokeConnectionDropMidCall(t *testing.T) {
+	bridge := transport.NewWebBridge()
+
+	connCh := make(chan *transport.WebConn, 1)
+	bridge.OnConnect(func(c *transport.WebConn) {
+		connCh <- c
+	})
+
+	srv := httptest.NewServer(bridge)
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	c := dialTestBridge(t, srv)
+	defer c.CloseNow()
+
+	go func() {
+		_, _, err := c.Read(ctx)
+		if err != nil {
+			return
+		}
+		_ = c.Close(websocket.StatusNormalClosure, "disconnect mid-invoke")
+	}()
+
+	var conn *transport.WebConn
+	select {
+	case conn = <-connCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for server-side connection")
+	}
+
+	_, err := conn.InvokeWithTimeout("ui.v1.UIService/GetViewport", nil, 2*time.Second)
+	if err == nil {
+		t.Fatal("expected invoke to fail after client disconnect")
+	}
+	if !strings.Contains(err.Error(), "connection closed") && !strings.Contains(err.Error(), "context deadline exceeded") {
+		t.Fatalf("unexpected error on disconnect: %v", err)
+	}
+}
+
+func TestWebBridgeMalformedJSONPayloads(t *testing.T) {
+	bridge := transport.NewWebBridge()
+	bridge.Register("hello.v1.HelloService/Greet", func(_ context.Context, payload json.RawMessage) (json.RawMessage, error) {
+		var req struct {
+			Name string `json:"name"`
+		}
+		if err := json.Unmarshal(payload, &req); err != nil {
+			return nil, &transport.WebError{Code: 3, Message: "invalid payload"}
+		}
+		return json.Marshal(map[string]string{"message": fmt.Sprintf("Hello, %s!", req.Name)})
+	})
+
+	srv := httptest.NewServer(bridge)
+	defer srv.Close()
+
+	c := dialTestBridge(t, srv)
+	defer c.CloseNow()
+
+	testCases := []struct {
+		name     string
+		message  string
+		wantCode float64
+	}{
+		{
+			name:     "invalid-json-document",
+			message:  `{bad-json`,
+			wantCode: 3,
+		},
+		{
+			name:     "invalid-envelope-field-type",
+			message:  `{"id":"e1","method":123,"payload":{}}`,
+			wantCode: 3,
+		},
+		{
+			name:     "malformed-handler-payload-shape",
+			message:  `{"id":"e2","method":"hello.v1.HelloService/Greet","payload":"not-an-object"}`,
+			wantCode: 3,
+		},
+	}
+
+	ctx := context.Background()
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			if err := c.Write(ctx, websocket.MessageText, []byte(tc.message)); err != nil {
+				t.Fatalf("write malformed payload: %v", err)
+			}
+
+			_, data, err := c.Read(ctx)
+			if err != nil {
+				t.Fatalf("read malformed payload response: %v", err)
+			}
+
+			var resp map[string]interface{}
+			if err := json.Unmarshal(data, &resp); err != nil {
+				t.Fatalf("unmarshal response: %v", err)
+			}
+
+			errObj, ok := resp["error"].(map[string]interface{})
+			if !ok {
+				t.Fatalf("expected error response, got: %v", resp)
+			}
+			if errObj["code"].(float64) != tc.wantCode {
+				t.Fatalf("error code = %v, want %v", errObj["code"], tc.wantCode)
+			}
+		})
+	}
+}
+
+func TestWebBridgeAllowOrigins(t *testing.T) {
+	bridge := transport.NewWebBridge()
+	bridge.AllowOrigins("allowed.example")
+
+	srv := httptest.NewServer(bridge)
+	defer srv.Close()
+
+	ctx := context.Background()
+	wsURL := "ws" + srv.URL[4:]
+
+	_, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
+		Subprotocols: []string{"holon-web"},
+		HTTPHeader:   http.Header{"Origin": []string{"blocked.example"}},
+	})
+	if err == nil {
+		t.Fatal("expected origin check failure")
+	}
+
+	bridge.AllowOrigins()
+	openConn, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
+		Subprotocols: []string{"holon-web"},
+	})
+	if err != nil {
+		t.Fatalf("dial with unrestricted origins: %v", err)
+	}
+	openConn.CloseNow()
+}
+
+func TestWebBridgeMarshalResponseFailure(t *testing.T) {
+	bridge := transport.NewWebBridge()
+	bridge.Register("bad.v1.Service/Method", func(_ context.Context, _ json.RawMessage) (json.RawMessage, error) {
+		// Invalid RawMessage bytes trigger marshalWsResp fallback envelope.
+		return json.RawMessage(`{bad-json`), nil
+	})
+
+	srv := httptest.NewServer(bridge)
+	defer srv.Close()
+
+	c := dialTestBridge(t, srv)
+	defer c.CloseNow()
+
+	resp := roundTrip(t, c, `{"id":"m1","method":"bad.v1.Service/Method","payload":{}}`)
+	errObj, ok := resp["error"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected error response, got: %v", resp)
+	}
+	if errObj["code"].(float64) != 13 {
+		t.Fatalf("error code = %v, want 13", errObj["code"])
 	}
 }
