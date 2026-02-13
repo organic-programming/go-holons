@@ -379,3 +379,61 @@ func TestHolonRPCDoubleClose(t *testing.T) {
 		t.Fatalf("second close failed: %v", err)
 	}
 }
+
+func TestHolonRPCConnectGuards(t *testing.T) {
+	client := holonrpc.NewClient()
+
+	if err := client.Connect(context.Background(), " "); err == nil {
+		t.Fatal("expected empty-url connect error")
+	}
+
+	if err := client.Close(); err != nil {
+		t.Fatalf("close client: %v", err)
+	}
+	if err := client.Connect(context.Background(), "ws://127.0.0.1:1/rpc"); err == nil {
+		t.Fatal("expected closed-client connect error")
+	}
+
+	_, addr := startHolonRPCServer(t, nil)
+	client2 := holonrpc.NewClient()
+	t.Cleanup(func() { _ = client2.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	if err := client2.Connect(ctx, addr); err != nil {
+		cancel()
+		t.Fatalf("initial connect: %v", err)
+	}
+	cancel()
+
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 2*time.Second)
+	err := client2.Connect(ctx2, addr)
+	cancel2()
+	if err == nil {
+		t.Fatal("expected already-connected error")
+	}
+}
+
+func TestHolonRPCConnectWithReconnectInitialDialFailure(t *testing.T) {
+	client := holonrpc.NewClient()
+	t.Cleanup(func() { _ = client.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	err := client.ConnectWithReconnect(ctx, "ws://127.0.0.1:1/rpc")
+	cancel()
+	if err == nil {
+		t.Fatal("expected reconnect-enabled connect dial failure")
+	}
+	if client.Connected() {
+		t.Fatal("Connected() = true after failed reconnect dial, want false")
+	}
+
+	invokeCtx, invokeCancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer invokeCancel()
+	_, invokeErr := client.Invoke(invokeCtx, "rpc.heartbeat", nil)
+	if invokeErr == nil {
+		t.Fatal("expected invoke error while client is disconnected")
+	}
+	if strings.Contains(invokeErr.Error(), "connection closed") {
+		t.Fatalf("expected no reconnect loop after initial failure, got: %v", invokeErr)
+	}
+}

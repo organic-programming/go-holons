@@ -25,7 +25,7 @@ import (
 //
 //	Request:  { "jsonrpc":"2.0", "id":"1", "method":"pkg.Service/Method", "params":{...} }
 //	Response: { "jsonrpc":"2.0", "id":"1", "result":{...} }
-//	Error:    { "jsonrpc":"2.0", "id":"1", "error":{"code":5, "message":"..."} }
+//	Error:    { "jsonrpc":"2.0", "id":"1", "error":{"code":-32601, "message":"..."} }
 //
 // A message is a request if it has "method". A message is a response if
 // it has "result" or "error". The "id" field correlates responses to requests.
@@ -295,6 +295,18 @@ func (b *WebBridge) handleRequest(ctx context.Context, conn *WebConn, msg wsMsg)
 	resp := wsMsg{
 		JSONRPC: "2.0",
 		ID:      msg.ID,
+	}
+
+	if msg.JSONRPC != "2.0" {
+		if isNotification {
+			return
+		}
+		resp.Error = &wsErr{Code: -32600, Message: "invalid request"}
+		data := marshalWsResp(resp)
+		conn.mu.Lock()
+		_ = conn.ws.Write(ctx, websocket.MessageText, data)
+		conn.mu.Unlock()
+		return
 	}
 
 	if method == "" {
