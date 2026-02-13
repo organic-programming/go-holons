@@ -47,12 +47,18 @@ type WebError struct {
 	Message string
 }
 
+// Error returns the string form of a WebError.
 func (e *WebError) Error() string {
 	return fmt.Sprintf("code %d: %s", e.Code, e.Message)
 }
 
 // WebConn represents an active browser WebSocket connection.
-// Use Invoke() to call methods registered on the browser side.
+//
+// Thread safety: Invoke is safe for concurrent callers. Writes are serialized
+// with an internal mutex and pending responses are correlated by request ID.
+//
+// Note: wsMsg uses string IDs for browser compatibility, while holonrpc's
+// rpcMessage uses json.RawMessage IDs to preserve raw JSON typing.
 type WebConn struct {
 	ws      *websocket.Conn
 	mu      sync.Mutex
@@ -147,6 +153,7 @@ func (b *WebBridge) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer c.CloseNow()
+	c.SetReadLimit(1 << 20)
 
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
@@ -183,6 +190,20 @@ func (b *WebBridge) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if msg.Method != "" {
+			if msg.JSONRPC != "2.0" {
+				if strings.TrimSpace(msg.ID) == "" {
+					continue
+				}
+				resp := marshalWsResp(wsMsg{
+					JSONRPC: "2.0",
+					ID:      msg.ID,
+					Error:   &wsErr{Code: -32600, Message: "invalid request"},
+				})
+				conn.mu.Lock()
+				_ = c.Write(ctx, websocket.MessageText, resp)
+				conn.mu.Unlock()
+				continue
+			}
 			// Incoming request from browser → dispatch to Go handler
 			go b.handleRequest(ctx, conn, msg)
 		} else {
@@ -265,9 +286,10 @@ type wsErr struct {
 // handleRequest dispatches an incoming browser request to a Go handler.
 func (b *WebBridge) handleRequest(ctx context.Context, conn *WebConn, msg wsMsg) {
 	isNotification := strings.TrimSpace(msg.ID) == ""
+	method := strings.TrimSpace(msg.Method)
 
 	b.mu.RLock()
-	handler, ok := b.handlers[msg.Method]
+	handler, ok := b.handlers[method]
 	b.mu.RUnlock()
 
 	resp := wsMsg{
@@ -275,26 +297,26 @@ func (b *WebBridge) handleRequest(ctx context.Context, conn *WebConn, msg wsMsg)
 		ID:      msg.ID,
 	}
 
-	if msg.JSONRPC != "2.0" {
+	if method == "" {
 		if isNotification {
 			return
 		}
 		resp.Error = &wsErr{Code: -32600, Message: "invalid request"}
 		data := marshalWsResp(resp)
 		conn.mu.Lock()
-		conn.ws.Write(ctx, websocket.MessageText, data)
+		_ = conn.ws.Write(ctx, websocket.MessageText, data)
 		conn.mu.Unlock()
 		return
 	}
 
-	if msg.Method == "rpc.heartbeat" {
+	if method == "rpc.heartbeat" {
 		if isNotification {
 			return
 		}
 		resp.Result = json.RawMessage("{}")
 		data := marshalWsResp(resp)
 		conn.mu.Lock()
-		conn.ws.Write(ctx, websocket.MessageText, data)
+		_ = conn.ws.Write(ctx, websocket.MessageText, data)
 		conn.mu.Unlock()
 		return
 	}
@@ -303,7 +325,7 @@ func (b *WebBridge) handleRequest(ctx context.Context, conn *WebConn, msg wsMsg)
 		if isNotification {
 			return
 		}
-		resp.Error = &wsErr{Code: 12, Message: fmt.Sprintf("method %q not registered", msg.Method)}
+		resp.Error = &wsErr{Code: -32601, Message: fmt.Sprintf("method %q not registered", method)}
 	} else {
 		params := msg.Params
 		if params == nil {
@@ -331,7 +353,7 @@ func (b *WebBridge) handleRequest(ctx context.Context, conn *WebConn, msg wsMsg)
 
 	data := marshalWsResp(resp)
 	conn.mu.Lock()
-	conn.ws.Write(ctx, websocket.MessageText, data)
+	_ = conn.ws.Write(ctx, websocket.MessageText, data)
 	conn.mu.Unlock()
 }
 
@@ -356,7 +378,7 @@ func (c *WebConn) handleResponse(msg wsMsg) {
 func marshalWsResp(r wsMsg) []byte {
 	data, err := json.Marshal(r)
 	if err != nil {
-		log.Printf("wsweb: marshal response: %v", err)
+		log.Printf("wsweb: marshal response id=%q: %v", r.ID, err)
 		return []byte(`{"jsonrpc":"2.0","error":{"code":13,"message":"internal marshal error"}}`)
 	}
 	return data

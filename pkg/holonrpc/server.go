@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -35,6 +36,8 @@ type Server struct {
 	peersMu sync.RWMutex
 	peers   map[string]*serverPeer
 
+	// connectQ buffers up to 32 client-connection events for WaitForClient.
+	// When it is full, new events are dropped to keep accept-path backpressure-free.
 	connectQ chan string
 
 	nextClientID int64
@@ -62,6 +65,8 @@ func NewServer(bindURL string) *Server {
 		address:  bindURL,
 		handlers: make(map[string]Handler),
 		peers:    make(map[string]*serverPeer),
+		// 32 is intentionally small: connection events are best-effort signals.
+		// Callers that need exact client state should inspect ClientIDs().
 		connectQ: make(chan string, 32),
 	}
 }
@@ -203,6 +208,16 @@ func (s *Server) Close(ctx context.Context) error {
 	s.listener = nil
 	s.mu.Unlock()
 
+	var shutdownErr error
+	if srv != nil {
+		if err := srv.Shutdown(ctx); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			shutdownErr = err
+		}
+	}
+	if lis != nil {
+		_ = lis.Close()
+	}
+
 	s.peersMu.Lock()
 	peers := make([]*serverPeer, 0, len(s.peers))
 	for _, peer := range s.peers {
@@ -217,13 +232,8 @@ func (s *Server) Close(ctx context.Context) error {
 		_ = peer.ws.Close(websocket.StatusGoingAway, "server shutdown")
 	}
 
-	if lis != nil {
-		_ = lis.Close()
-	}
-	if srv != nil {
-		if err := srv.Shutdown(ctx); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			return err
-		}
+	if shutdownErr != nil {
+		return shutdownErr
 	}
 	return nil
 }
@@ -311,6 +321,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		_ = c.Close(websocket.StatusProtocolError, "missing holon-rpc subprotocol")
 		return
 	}
+	c.SetReadLimit(1 << 20)
 
 	clientID := fmt.Sprintf("c%d", atomic.AddInt64(&s.nextClientID, 1))
 	ctx, cancel := context.WithCancel(r.Context())
@@ -330,6 +341,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	select {
 	case s.connectQ <- clientID:
 	default:
+		log.Printf("holon-rpc: dropping connect event for %s: WaitForClient queue is full", clientID)
 	}
 
 	defer func() {
@@ -416,8 +428,13 @@ func (s *Server) handlePeerRequest(peer *serverPeer, msg rpcMessage) {
 		return
 	}
 
-	result, err := handler(peer.ctx, params)
+	// The request context is peer-scoped: disconnecting the peer cancels
+	// the handler context and allows in-flight work to terminate promptly.
+	result, err := s.callPeerHandler(peer.ctx, handler, params)
 	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return
+		}
 		if !hasID(reqID) {
 			return
 		}
@@ -432,6 +449,26 @@ func (s *Server) handlePeerRequest(peer *serverPeer, msg rpcMessage) {
 
 	if hasID(reqID) {
 		_ = s.sendPeerResult(peer, reqID, result)
+	}
+}
+
+func (s *Server) callPeerHandler(ctx context.Context, handler Handler, params map[string]any) (map[string]any, error) {
+	type handlerResult struct {
+		result map[string]any
+		err    error
+	}
+
+	done := make(chan handlerResult, 1)
+	go func() {
+		res, err := handler(ctx, params)
+		done <- handlerResult{result: res, err: err}
+	}()
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case out := <-done:
+		return out.result, out.err
 	}
 }
 

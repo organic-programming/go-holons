@@ -32,6 +32,7 @@ func (m *MemListener) DialContext(_ interface{}, _ string) (net.Conn, error) {
 	return m.Listener.Dial()
 }
 
+// Addr returns the canonical in-memory listener address.
 func (m *MemListener) Addr() net.Addr {
 	return memAddr{}
 }

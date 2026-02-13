@@ -44,10 +44,18 @@ type ResponseError struct {
 	Data    any    `json:"data,omitempty"`
 }
 
+// Error returns the formatted JSON-RPC error string.
 func (e *ResponseError) Error() string {
+	if e == nil {
+		return "rpc error <nil>"
+	}
+	if e.Data != nil {
+		return fmt.Sprintf("rpc error %d: %s (data: %v)", e.Code, e.Message, e.Data)
+	}
 	return fmt.Sprintf("rpc error %d: %s", e.Code, e.Message)
 }
 
+// rpcMessage is the internal JSON-RPC envelope used for both requests and responses.
 type rpcMessage struct {
 	JSONRPC string          `json:"jsonrpc,omitempty"`
 	ID      json.RawMessage `json:"id,omitempty"`
@@ -57,16 +65,19 @@ type rpcMessage struct {
 	Error   *ResponseError  `json:"error,omitempty"`
 }
 
+// makeID encodes IDs as JSON strings because Holon-RPC IDs are textual.
 func makeID(id string) json.RawMessage {
 	b, _ := json.Marshal(id)
 	return json.RawMessage(b)
 }
 
+// hasID treats empty and explicit null IDs as notifications (no response required).
 func hasID(id json.RawMessage) bool {
 	trimmed := bytes.TrimSpace(id)
 	return len(trimmed) > 0 && !bytes.Equal(trimmed, []byte("null"))
 }
 
+// idKey normalizes a raw ID to a map key; notifications return false.
 func idKey(id json.RawMessage) (string, bool) {
 	trimmed := bytes.TrimSpace(id)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
@@ -75,6 +86,7 @@ func idKey(id json.RawMessage) (string, bool) {
 	return string(trimmed), true
 }
 
+// decodeStringID rejects non-string IDs, including numbers and objects.
 func decodeStringID(id json.RawMessage) (string, error) {
 	var out string
 	if err := json.Unmarshal(bytes.TrimSpace(id), &out); err != nil {
@@ -83,13 +95,15 @@ func decodeStringID(id json.RawMessage) (string, error) {
 	return out, nil
 }
 
+// decodeParams accepts missing or null params as an empty object by spec.
+// Non-object JSON values are rejected with an invalid-params style error.
 func decodeParams(raw json.RawMessage) (map[string]any, error) {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 {
 		return map[string]any{}, nil
 	}
 	if bytes.Equal(trimmed, []byte("null")) {
-		return nil, errors.New("params must be an object")
+		return map[string]any{}, nil
 	}
 
 	var params map[string]any
@@ -102,6 +116,8 @@ func decodeParams(raw json.RawMessage) (map[string]any, error) {
 	return params, nil
 }
 
+// decodeResult preserves object results and wraps scalar results as {"value": ...}.
+// Missing or null results map to an empty object for convenience.
 func decodeResult(raw json.RawMessage) (map[string]any, error) {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 {
@@ -122,6 +138,7 @@ func decodeResult(raw json.RawMessage) (map[string]any, error) {
 	return map[string]any{"value": value}, nil
 }
 
+// marshalObject always serializes nil maps as {}, never as JSON null.
 func marshalObject(obj map[string]any) (json.RawMessage, error) {
 	if obj == nil {
 		return json.RawMessage("{}"), nil
@@ -133,6 +150,7 @@ func marshalObject(obj map[string]any) (json.RawMessage, error) {
 	return json.RawMessage(b), nil
 }
 
+// marshalMessage serializes the full RPC envelope and surfaces encoding errors.
 func marshalMessage(msg rpcMessage) ([]byte, error) {
 	out, err := json.Marshal(msg)
 	if err != nil {

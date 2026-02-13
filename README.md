@@ -5,7 +5,7 @@ author:
   name: "B. ALTER"
   copyright: "© 2026 Benoit Pereira da Silva"
 created: 2026-02-12
-revised: 2026-02-12
+revised: 2026-02-13
 lang: en-US
 origin_lang: en-US
 translation_of: null
@@ -83,6 +83,30 @@ http.ListenAndServe(":8080", mux)
 |-----------|--------|
 | Browser → Server | `{ "jsonrpc":"2.0", "id":"1", "method":"pkg.Service/Method", "params": {...} }` |
 | Server → Browser (success) | `{ "jsonrpc":"2.0", "id":"1", "result": {...} }` |
-| Server → Browser (error) | `{ "jsonrpc":"2.0", "id":"1", "error": { "code": 12, "message": "..." } }` |
+| Server → Browser (error) | `{ "jsonrpc":"2.0", "id":"1", "error": { "code": -32601, "message": "..." } }` |
+
+## Quality Gates
+
+Run the full production robustness suite with race detection:
+
+```bash
+cd sdk/go-holons
+go test ./... -v -count=1 -race
+```
+
+Coverage targets (minimum 80% for each package):
+
+```bash
+go test -coverprofile=c.out ./pkg/transport/ && go tool cover -func=c.out
+go test -coverprofile=c.out ./pkg/holonrpc/ && go tool cover -func=c.out
+go test -coverprofile=c.out ./pkg/serve/ && go tool cover -func=c.out
+go test -coverprofile=c.out ./pkg/grpcclient/ && go tool cover -func=c.out
+```
+
+Static analysis:
+
+```bash
+go vet ./...
+```
 
 See [AGENT.md](./AGENT.md) for full documentation.

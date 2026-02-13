@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/Organic-Programming/go-holons/pkg/transport"
 
@@ -42,12 +43,16 @@ func ParseFlags(args []string) string {
 
 // Run starts a gRPC server on the given transport URI with reflection
 // enabled. It blocks until SIGTERM/SIGINT is received, then shuts down
-// gracefully. This is the standard entry point for any Go holon's serve.
+// gracefully. If in-flight RPC draining exceeds 10 seconds, the server is
+// force-stopped to satisfy the operational shutdown deadline.
+// This is the standard entry point for any Go holon's serve.
 func Run(listenURI string, register RegisterFunc) error {
 	return RunWithOptions(listenURI, register, true)
 }
 
 // RunWithOptions is like Run but lets you control reflection.
+// It installs SIGTERM/SIGINT handlers, starts graceful draining on signal,
+// and force-stops after 10 seconds if draining does not complete.
 func RunWithOptions(listenURI string, register RegisterFunc, reflect bool) error {
 	lis, err := transport.Listen(listenURI)
 	if err != nil {
@@ -64,10 +69,23 @@ func RunWithOptions(listenURI string, register RegisterFunc, reflect bool) error
 	// Graceful shutdown on SIGTERM/SIGINT
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+	defer signal.Stop(sigCh)
 	go func() {
 		<-sigCh
 		log.Println("shutting down gRPC server...")
-		s.GracefulStop()
+
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			s.GracefulStop()
+		}()
+
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			log.Println("graceful stop timed out after 10s; forcing hard stop")
+			s.Stop()
+		}
 	}()
 
 	mode := "reflection ON"

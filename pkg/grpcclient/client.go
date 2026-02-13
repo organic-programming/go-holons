@@ -55,6 +55,10 @@ func Dial(ctx context.Context, address string) (*grpc.ClientConn, error) {
 //
 // This is the purest form of inter-holon communication: no port allocation,
 // no socket files, no network stack — just a pipe. Inspired by LSP.
+//
+// Startup detection reads the first byte emitted on stdout, which confirms
+// the child gRPC server has started producing HTTP/2 traffic. The byte is
+// then re-inserted into the stream so no protocol data is lost.
 func DialStdio(ctx context.Context, binaryPath string) (*grpc.ClientConn, *exec.Cmd, error) {
 	cmd := exec.CommandContext(ctx, binaryPath, "serve", "--listen", "stdio://")
 

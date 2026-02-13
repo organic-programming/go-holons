@@ -14,6 +14,10 @@ import (
 // DialWebSocket connects to a gRPC server via WebSocket.
 // uri is "ws://host:port/path" or "wss://host:port/path".
 // The path defaults to "/grpc" if omitted.
+//
+// It intentionally negotiates the WebSocket subprotocol "grpc", not
+// "holon-rpc": this transport carries raw gRPC HTTP/2 bytes inside binary
+// WebSocket frames, while holon-rpc is JSON-RPC 2.0 over text frames.
 func DialWebSocket(ctx context.Context, uri string) (*grpc.ClientConn, error) {
 	// Connect WebSocket
 	c, _, err := websocket.Dial(ctx, uri, &websocket.DialOptions{

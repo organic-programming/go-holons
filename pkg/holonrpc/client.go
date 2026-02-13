@@ -5,9 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"math/rand"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"nhooyr.io/websocket"
 )
@@ -25,6 +28,13 @@ type Client struct {
 	done    chan struct{}
 	closed  bool
 
+	reconnectURL        string
+	reconnectCtx        context.Context
+	reconnectCancel     context.CancelFunc
+	reconnectParentStop func() bool
+	reconnectWake       chan struct{}
+	reconnectDone       chan struct{}
+
 	sendMu sync.Mutex
 
 	handlersMu sync.RWMutex
@@ -35,6 +45,13 @@ type Client struct {
 
 	nextClientID int64
 }
+
+const (
+	reconnectMinDelay = 500 * time.Millisecond
+	reconnectMaxDelay = 30 * time.Second
+	reconnectFactor   = 2.0
+	reconnectJitter   = 0.1
+)
 
 // NewClient creates an empty Holon-RPC client.
 func NewClient() *Client {
@@ -86,6 +103,7 @@ func (c *Client) Connect(ctx context.Context, url string) error {
 		_ = ws.Close(websocket.StatusProtocolError, "missing holon-rpc subprotocol")
 		return errors.New("holon-rpc: server did not negotiate holon-rpc")
 	}
+	ws.SetReadLimit(1 << 20)
 
 	rxCtx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -107,6 +125,60 @@ func (c *Client) Connect(ctx context.Context, url string) error {
 	return nil
 }
 
+// ConnectWithReconnect dials a Holon-RPC endpoint and enables automatic
+// reconnect with exponential backoff when the connection is dropped.
+//
+// The provided ctx controls reconnect lifetime after the initial dial.
+func (c *Client) ConnectWithReconnect(ctx context.Context, url string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if strings.TrimSpace(url) == "" {
+		return errors.New("holon-rpc: url is required")
+	}
+
+	reconnectCtx, reconnectCancel := context.WithCancel(context.Background())
+	reconnectParentStop := context.AfterFunc(ctx, reconnectCancel)
+	reconnectWake := make(chan struct{}, 1)
+	reconnectDone := make(chan struct{})
+
+	c.stateMu.Lock()
+	if c.closed {
+		c.stateMu.Unlock()
+		reconnectParentStop()
+		reconnectCancel()
+		return errors.New("holon-rpc: client is closed")
+	}
+	if c.ws != nil || c.reconnectCtx != nil {
+		c.stateMu.Unlock()
+		reconnectParentStop()
+		reconnectCancel()
+		return errors.New("holon-rpc: client already connected")
+	}
+	c.reconnectURL = url
+	c.reconnectCtx = reconnectCtx
+	c.reconnectCancel = reconnectCancel
+	c.reconnectParentStop = reconnectParentStop
+	c.reconnectWake = reconnectWake
+	c.reconnectDone = reconnectDone
+	c.stateMu.Unlock()
+
+	go c.reconnectLoop(reconnectCtx, reconnectWake, reconnectDone)
+
+	if err := c.Connect(ctx, url); err != nil {
+		c.disableReconnect(reconnectDone)
+		return err
+	}
+	return nil
+}
+
+// Connected reports whether the client currently has an active WebSocket.
+func (c *Client) Connected() bool {
+	c.stateMu.RLock()
+	defer c.stateMu.RUnlock()
+	return !c.closed && c.ws != nil
+}
+
 // Close gracefully closes the client connection and stops runtime goroutines.
 func (c *Client) Close() error {
 	c.stateMu.Lock()
@@ -118,13 +190,28 @@ func (c *Client) Close() error {
 	ws := c.ws
 	cancel := c.cancel
 	done := c.done
+	reconnectCancel := c.reconnectCancel
+	reconnectParentStop := c.reconnectParentStop
+	reconnectDone := c.reconnectDone
 	c.ws = nil
 	c.cancel = nil
 	c.done = nil
+	c.reconnectURL = ""
+	c.reconnectCtx = nil
+	c.reconnectCancel = nil
+	c.reconnectParentStop = nil
+	c.reconnectWake = nil
+	c.reconnectDone = nil
 	c.stateMu.Unlock()
 
 	if cancel != nil {
 		cancel()
+	}
+	if reconnectParentStop != nil {
+		reconnectParentStop()
+	}
+	if reconnectCancel != nil {
+		reconnectCancel()
 	}
 
 	if ws != nil {
@@ -132,6 +219,9 @@ func (c *Client) Close() error {
 	}
 	if done != nil {
 		<-done
+	}
+	if reconnectDone != nil {
+		<-reconnectDone
 	}
 
 	c.failAllPending(errConnectionClosed)
@@ -210,6 +300,12 @@ func (c *Client) currentConn() (*websocket.Conn, context.Context, error) {
 		return nil, nil, errors.New("holon-rpc: client is closed")
 	}
 	if c.ws == nil || c.cancel == nil || c.rxCtx == nil {
+		if c.reconnectCtx != nil {
+			return nil, nil, &ResponseError{
+				Code:    codeUnavailable,
+				Message: errConnectionClosed.Error(),
+			}
+		}
 		return nil, nil, errors.New("holon-rpc: client is not connected")
 	}
 	return c.ws, c.rxCtx, nil
@@ -251,6 +347,9 @@ func (c *Client) readLoop(ws *websocket.Conn, done chan struct{}) {
 }
 
 func (c *Client) onDisconnect(ws *websocket.Conn) {
+	shouldFailPending := false
+	var reconnectWake chan struct{}
+
 	c.stateMu.Lock()
 	if c.ws == ws {
 		c.ws = nil
@@ -260,10 +359,146 @@ func (c *Client) onDisconnect(ws *websocket.Conn) {
 		c.cancel = nil
 		c.rxCtx = nil
 		c.done = nil
+		shouldFailPending = true
+		if !c.closed && c.reconnectCtx != nil && c.reconnectWake != nil {
+			reconnectWake = c.reconnectWake
+		}
 	}
 	c.stateMu.Unlock()
 
-	c.failAllPending(errConnectionClosed)
+	if shouldFailPending {
+		c.failAllPending(errConnectionClosed)
+	}
+	if reconnectWake != nil {
+		select {
+		case reconnectWake <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (c *Client) reconnectLoop(ctx context.Context, wake <-chan struct{}, done chan struct{}) {
+	defer close(done)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-wake:
+		}
+
+		attempt := 0
+		for {
+			c.stateMu.RLock()
+			if c.closed {
+				c.stateMu.RUnlock()
+				return
+			}
+			if c.ws != nil {
+				c.stateMu.RUnlock()
+				break
+			}
+			url := c.reconnectURL
+			c.stateMu.RUnlock()
+
+			ws, _, err := websocket.Dial(ctx, url, &websocket.DialOptions{
+				Subprotocols: []string{"holon-rpc"},
+			})
+			if err == nil {
+				if ws.Subprotocol() != "holon-rpc" {
+					_ = ws.Close(websocket.StatusProtocolError, "missing holon-rpc subprotocol")
+				} else {
+					ws.SetReadLimit(1 << 20)
+
+					rxCtx, cancel := context.WithCancel(context.Background())
+					readDone := make(chan struct{})
+
+					c.stateMu.Lock()
+					switch {
+					case c.closed:
+						c.stateMu.Unlock()
+						cancel()
+						_ = ws.Close(websocket.StatusNormalClosure, "client closed")
+						return
+					case c.ws != nil:
+						c.stateMu.Unlock()
+						cancel()
+						_ = ws.Close(websocket.StatusNormalClosure, "already connected")
+						break
+					default:
+						c.ws = ws
+						c.rxCtx = rxCtx
+						c.cancel = cancel
+						c.done = readDone
+						c.stateMu.Unlock()
+
+						go c.readLoop(ws, readDone)
+						break
+					}
+
+					if c.Connected() {
+						break
+					}
+				}
+			}
+
+			delay := reconnectDelay(attempt)
+			attempt++
+
+			timer := time.NewTimer(delay)
+			select {
+			case <-ctx.Done():
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				return
+			case <-timer.C:
+			}
+		}
+	}
+}
+
+func (c *Client) disableReconnect(expectedDone chan struct{}) {
+	c.stateMu.Lock()
+	if c.reconnectDone != expectedDone {
+		c.stateMu.Unlock()
+		return
+	}
+
+	reconnectCancel := c.reconnectCancel
+	reconnectParentStop := c.reconnectParentStop
+	reconnectDone := c.reconnectDone
+
+	c.reconnectURL = ""
+	c.reconnectCtx = nil
+	c.reconnectCancel = nil
+	c.reconnectParentStop = nil
+	c.reconnectWake = nil
+	c.reconnectDone = nil
+	c.stateMu.Unlock()
+
+	if reconnectParentStop != nil {
+		reconnectParentStop()
+	}
+	if reconnectCancel != nil {
+		reconnectCancel()
+	}
+	if reconnectDone != nil {
+		<-reconnectDone
+	}
+
+}
+
+func reconnectDelay(attempt int) time.Duration {
+	base := float64(reconnectMinDelay) * math.Pow(reconnectFactor, float64(attempt))
+	if base > float64(reconnectMaxDelay) {
+		base = float64(reconnectMaxDelay)
+	}
+	jitter := 1 + rand.Float64()*reconnectJitter
+	return time.Duration(base * jitter)
 }
 
 func (c *Client) handleRequest(ws *websocket.Conn, ctx context.Context, msg rpcMessage) {

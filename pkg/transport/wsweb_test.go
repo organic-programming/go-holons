@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -118,7 +119,7 @@ func TestWebBridgeMethodNotFound(t *testing.T) {
 
 	resp := roundTrip(t, c, `{"jsonrpc":"2.0","id":"3","method":"no.Such/Method"}`)
 	errObj := resp["error"].(map[string]interface{})
-	if errObj["code"].(float64) != 12 {
+	if errObj["code"].(float64) != -32601 {
 		t.Errorf("code = %v", errObj["code"])
 	}
 }
@@ -231,7 +232,7 @@ func TestWebBridgeGoCallsBrowserError(t *testing.T) {
 				resp, _ := json.Marshal(map[string]interface{}{
 					"jsonrpc": "2.0",
 					"id":      msg["id"],
-					"error":   map[string]interface{}{"code": 3, "message": "not supported"},
+					"error":   map[string]interface{}{"code": -32700, "message": "not supported"},
 				})
 				c.Write(ctx, websocket.MessageText, resp)
 			}
@@ -249,8 +250,8 @@ func TestWebBridgeGoCallsBrowserError(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected WebError, got %T: %v", err, err)
 	}
-	if webErr.Code != 3 {
-		t.Errorf("code = %d, want 3", webErr.Code)
+	if webErr.Code != -32700 {
+		t.Errorf("code = %d, want -32700", webErr.Code)
 	}
 }
 
@@ -307,6 +308,88 @@ func TestWebBridgeHeartbeatCompatibility(t *testing.T) {
 	}
 	if len(result) != 0 {
 		t.Fatalf("heartbeat result = %v, want {}", result)
+	}
+}
+
+func TestWebBridgeHeartbeatSuccess(t *testing.T) {
+	bridge := transport.NewWebBridge()
+	srv := httptest.NewServer(bridge)
+	defer srv.Close()
+
+	c := dialTestBridge(t, srv)
+	defer c.CloseNow()
+
+	resp := roundTrip(t, c, `{"jsonrpc":"2.0","id":"hb-1","method":"rpc.heartbeat","params":{}}`)
+	if resp["id"] != "hb-1" {
+		t.Fatalf("id = %v, want hb-1", resp["id"])
+	}
+	result, ok := resp["result"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected heartbeat success response, got: %v", resp)
+	}
+	if len(result) != 0 {
+		t.Fatalf("heartbeat result = %v, want {}", result)
+	}
+}
+
+func TestWebBridgeNotification(t *testing.T) {
+	bridge := transport.NewWebBridge()
+	called := make(chan struct{}, 1)
+	bridge.Register("notify.v1.Notify/Send", func(_ context.Context, payload json.RawMessage) (json.RawMessage, error) {
+		var body map[string]interface{}
+		_ = json.Unmarshal(payload, &body)
+		called <- struct{}{}
+		return json.Marshal(map[string]bool{"ok": true})
+	})
+
+	srv := httptest.NewServer(bridge)
+	defer srv.Close()
+
+	c := dialTestBridge(t, srv)
+	defer c.CloseNow()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	req := `{"jsonrpc":"2.0","method":"notify.v1.Notify/Send","params":{"value":"x"}}`
+	if err := c.Write(ctx, websocket.MessageText, []byte(req)); err != nil {
+		t.Fatalf("write notification: %v", err)
+	}
+
+	select {
+	case <-called:
+	case <-time.After(2 * time.Second):
+		t.Fatal("notification handler was not called")
+	}
+
+	readCtx, cancelRead := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancelRead()
+	_, _, err := c.Read(readCtx)
+	if err == nil {
+		t.Fatal("expected no response for notification")
+	}
+	if !strings.Contains(err.Error(), context.DeadlineExceeded.Error()) && !strings.Contains(err.Error(), "closed network connection") {
+		t.Fatalf("unexpected notification read error: %v", err)
+	}
+}
+
+func TestWebBridgeInvalidJSONRPCVersion(t *testing.T) {
+	bridge := transport.NewWebBridge()
+	bridge.Register("hello.v1.HelloService/Greet", func(_ context.Context, _ json.RawMessage) (json.RawMessage, error) {
+		return json.Marshal(map[string]string{"message": "ok"})
+	})
+	srv := httptest.NewServer(bridge)
+	defer srv.Close()
+
+	c := dialTestBridge(t, srv)
+	defer c.CloseNow()
+
+	resp := roundTrip(t, c, `{"jsonrpc":"1.0","id":"v1","method":"hello.v1.HelloService/Greet","params":{}}`)
+	errObj, ok := resp["error"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected error object, got: %v", resp)
+	}
+	if errObj["code"].(float64) != -32600 {
+		t.Fatalf("code = %v, want -32600", errObj["code"])
 	}
 }
 
@@ -541,6 +624,112 @@ func TestWebBridgeInvokeConnectionDropMidCall(t *testing.T) {
 	}
 }
 
+func TestWebBridgeConcurrentLoad(t *testing.T) {
+	bridge := transport.NewWebBridge()
+	bridge.Register("echo.v1.Echo/Ping", func(_ context.Context, payload json.RawMessage) (json.RawMessage, error) {
+		return payload, nil
+	})
+
+	srv := httptest.NewServer(bridge)
+	defer srv.Close()
+
+	const n = 50
+	errCh := make(chan error, n)
+	var wg sync.WaitGroup
+	wg.Add(n)
+
+	for i := 0; i < n; i++ {
+		i := i
+		go func() {
+			defer wg.Done()
+
+			conn := dialTestBridge(t, srv)
+			defer conn.CloseNow()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+
+			req, err := json.Marshal(map[string]interface{}{
+				"jsonrpc": "2.0",
+				"id":      fmt.Sprintf("c-%d", i),
+				"method":  "echo.v1.Echo/Ping",
+				"params":  map[string]int{"n": i},
+			})
+			if err != nil {
+				errCh <- err
+				return
+			}
+			if err := conn.Write(ctx, websocket.MessageText, req); err != nil {
+				errCh <- err
+				return
+			}
+
+			_, data, err := conn.Read(ctx)
+			if err != nil {
+				errCh <- err
+				return
+			}
+
+			var resp map[string]interface{}
+			if err := json.Unmarshal(data, &resp); err != nil {
+				errCh <- err
+				return
+			}
+			result, ok := resp["result"].(map[string]interface{})
+			if !ok {
+				errCh <- fmt.Errorf("missing result: %v", resp)
+				return
+			}
+			got, _ := result["n"].(float64)
+			if int(got) != i {
+				errCh <- fmt.Errorf("roundtrip mismatch: got %v want %d", got, i)
+				return
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestWebBridgeResourceCleanup(t *testing.T) {
+	bridge := transport.NewWebBridge()
+	bridge.Register("rpc.heartbeat", func(_ context.Context, _ json.RawMessage) (json.RawMessage, error) {
+		return json.RawMessage(`{}`), nil
+	})
+
+	srv := httptest.NewServer(bridge)
+	defer srv.Close()
+
+	runtime.GC()
+	time.Sleep(150 * time.Millisecond)
+	before := runtime.NumGoroutine()
+
+	for i := 0; i < 100; i++ {
+		c := dialTestBridge(t, srv)
+		_ = roundTrip(t, c, `{"jsonrpc":"2.0","id":"r1","method":"rpc.heartbeat","params":{}}`)
+		c.CloseNow()
+	}
+
+	time.Sleep(500 * time.Millisecond)
+	runtime.GC()
+	time.Sleep(150 * time.Millisecond)
+	after := runtime.NumGoroutine()
+
+	delta := after - before
+	if delta < 0 {
+		delta = -delta
+	}
+	if delta > 5 {
+		t.Fatalf("goroutine delta = %d (before=%d after=%d), want <= 5", delta, before, after)
+	}
+}
+
 func TestWebBridgeMalformedJSONPayloads(t *testing.T) {
 	bridge := transport.NewWebBridge()
 	bridge.Register("hello.v1.HelloService/Greet", func(_ context.Context, payload json.RawMessage) (json.RawMessage, error) {
@@ -548,7 +737,7 @@ func TestWebBridgeMalformedJSONPayloads(t *testing.T) {
 			Name string `json:"name"`
 		}
 		if err := json.Unmarshal(payload, &req); err != nil {
-			return nil, &transport.WebError{Code: 3, Message: "invalid payload"}
+			return nil, &transport.WebError{Code: -32700, Message: "invalid payload"}
 		}
 		return json.Marshal(map[string]string{"message": fmt.Sprintf("Hello, %s!", req.Name)})
 	})
@@ -577,7 +766,7 @@ func TestWebBridgeMalformedJSONPayloads(t *testing.T) {
 		{
 			name:     "malformed-handler-payload-shape",
 			message:  `{"jsonrpc":"2.0","id":"e2","method":"hello.v1.HelloService/Greet","params":"not-an-object"}`,
-			wantCode: 3,
+			wantCode: -32700,
 		},
 	}
 
