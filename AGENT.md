@@ -48,7 +48,7 @@ The four packages map to the four phases of inter-holon communication:
 | **Listen** | `transport` | The holon server |
 | **Serve** | `serve` | The holon's `serve` subcommand |
 | **Dial** | `grpcclient` | The holon client (or OP) |
-| **Holon-RPC** | `holonrpc` | Browser ↔ holon bidirectional RPC |
+| **Holon-RPC** | `holonrpc` | Holon-RPC client + server (see [PROTOCOL.md §4](../../PROTOCOL.md#4-holon-rpc-binding)) |
 
 ---
 
@@ -87,6 +87,9 @@ transport.Scheme("tcp://:9090") // → "tcp"
 | `mem://` | In-process bufconn, testing and composite holons | Optional |
 | `ws://<host>:<port>[/path]` | WebSocket, browser-accessible, NAT-friendly | Optional |
 | `wss://<host>:<port>[/path]` | WebSocket over TLS | Optional |
+
+See [PROTOCOL.md §2.7](../../PROTOCOL.md#27-transport-properties) for per-scheme
+valence (mono/multi) and duplex (full/simulated) properties.
 
 ### stdio transport internals
 
@@ -242,9 +245,10 @@ both ephemeral (call and kill) and long-running (reuse connection) patterns.
 
 ## 5. `pkg/holonrpc` — Holon-RPC client and server
 
-Implements PROTOCOL.md §4: JSON-RPC 2.0 over WebSocket with the
-`holon-rpc` subprotocol. Fully bidirectional — both client and server
-can initiate calls.
+Implements [PROTOCOL.md §4](../../PROTOCOL.md#4-holon-rpc-binding):
+JSON-RPC 2.0 over WebSocket with the `holon-rpc` subprotocol
+(mandatory handshake per §4.3). Fully bidirectional — both
+client and server can initiate calls (§4.6).
 
 ### Client API
 
@@ -308,20 +312,21 @@ When using `ConnectWithReconnect`, the client automatically:
 4. Resumes normal operation — pending `Invoke` calls during disconnection
    fail with `UNAVAILABLE` (code 14); calls after reconnection succeed.
 
-### ID namespacing
+### ID namespacing (PROTOCOL.md §4.6)
 
-- Client-originated IDs: `"c1"`, `"c2"`, ...
-- Server-originated IDs: `"s1"`, `"s2"`, ... (mandatory `s` prefix per PROTOCOL.md §4.6)
+- Client-originated IDs: any string or number chosen by the client (convention: `"c1"`, `"c2"`, ...)
+- Server-originated IDs: **must** be prefixed with `s` (e.g., `"s1"`, `"s2"`)
 
-### Error codes
+### Error codes (PROTOCOL.md §5.2)
 
-| Code | Meaning |
-|------|---------|
-| -32700 | Parse error |
-| -32600 | Invalid request |
-| -32601 | Method not found |
-| -32602 | Invalid params |
-| 14 | Unavailable (peer disconnected) |
+| Code | Name | Meaning |
+|------|------|---------|
+| -32700 | Parse error | Invalid JSON |
+| -32600 | Invalid Request | Missing required fields |
+| -32601 | Method not found | Unknown method string |
+| -32602 | Invalid params | Invalid method parameters |
+| -32603 | Internal error | JSON-RPC internal error |
+| 14 | UNAVAILABLE | Peer disconnected (gRPC status code, §5.1) |
 
 ---
 
@@ -343,7 +348,7 @@ When modifying this SDK:
 2. **No domain logic**: this is plumbing, not policy.
 3. **No proto files**: this SDK has no contract of its own.
 4. **Test transports**: any change to `transport` must be verified with
-   all five schemes: TCP, Unix, stdio, mem, WebSocket.
+   all six schemes: TCP, Unix, stdio, mem, WebSocket, WebSocket+TLS.
 
 ---
 

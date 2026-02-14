@@ -53,31 +53,33 @@ the bridge translates JSON ↔ handler calls entirely in-process.
 
 ```
 ┌──────────────┐   WebSocket       ┌──────────────────────────────────┐
-│  Browser     │  ws://:8080/ws    │  Go Holon                        │
+│  Browser     │  ws://:8080/rpc   │  Go Holon                        │
 │  js-web-     │ ◄──────────────►  │  ┌──────────┐   ┌─────────────┐ │
-│  holons      │  holon-rpc proto  │  │ WebBridge │   │ gRPC server │ │
-│  (client)    │                   │  │ (JSON/WS) │   │ (standard)  │ │
+│  holons      │  holon-rpc sub-   │  │ holonrpc │   │ gRPC server │ │
+│  (client)    │  protocol         │  │ (JSON/WS)│   │ (standard)  │ │
 └──────────────┘                   │  └──────────┘   └─────────────┘ │
                                    └──────────────────────────────────┘
 ```
 
-### Usage
+### Usage (`pkg/holonrpc`)
 
 ```go
-bridge := transport.NewWebBridge()
+import "github.com/Organic-Programming/go-holons/pkg/holonrpc"
 
-bridge.Register("hello.v1.HelloService/Greet",
-    func(ctx context.Context, params json.RawMessage) (json.RawMessage, error) {
-        var req struct { Name string `json:"name"` }
-        json.Unmarshal(params, &req)
-        return json.Marshal(map[string]string{"message": "Hello, " + req.Name + "!"})
+server := holonrpc.NewServer("ws://127.0.0.1:8080/rpc")
+
+server.Register("hello.v1.HelloService/Greet",
+    func(ctx context.Context, params map[string]any) (map[string]any, error) {
+        name, _ := params["name"].(string)
+        return map[string]any{"message": "Hello, " + name + "!"}, nil
     },
 )
 
-mux := http.NewServeMux()
-mux.HandleFunc("/ws", bridge.HandleWebSocket)
-http.ListenAndServe(":8080", mux)
+server.Start()
+defer server.Close(context.Background())
 ```
+
+See [AGENT.md §5](./AGENT.md#5-pkgholonrpc--holon-rpc-client-and-server) for full Client and Server API.
 
 ### Wire Protocol (Holon-RPC)
 
@@ -86,10 +88,10 @@ http.ListenAndServe(":8080", mux)
 | Client → Server | `{ "jsonrpc":"2.0", "id":"c1", "method":"pkg.Service/Method", "params": {...} }` |
 | Server → Client (response) | `{ "jsonrpc":"2.0", "id":"c1", "result": {...} }` |
 | Server → Client (error) | `{ "jsonrpc":"2.0", "id":"c1", "error": { "code": -32601, "message": "..." } }` |
-| Server → Client (call) | `{ "jsonrpc":"2.0", "id":"s1", "method":"client.v1/Info", "params": {...} }` |
+| Server → Client (call) | `{ "jsonrpc":"2.0", "id":"s1", "method":"client.v1.Client/Info", "params": {...} }` |
 | Client → Server (response) | `{ "jsonrpc":"2.0", "id":"s1", "result": {...} }` |
 
-Server-originated IDs use the `s` prefix per PROTOCOL.md §4.6.
+Server-originated IDs use the `s` prefix per [PROTOCOL.md §4.6](../../PROTOCOL.md#46-bidirectional-calls).
 
 ## Quality Gates
 
