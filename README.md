@@ -42,6 +42,20 @@ This is **not** a holon. It is a library. Holons import it.
 | `ws://<host>:<port>` | WebSocket (browser, NAT traversal) |
 | `wss://<host>:<port>` | WebSocket over TLS |
 
+## WSS Configuration
+
+`wss://` listeners require explicit certificate and key files. The SDK does
+not auto-generate TLS certificates at runtime.
+
+You can provision cert/key with either method:
+
+1. URI query params:
+   `wss://127.0.0.1:8443/grpc?cert=/path/to/server.crt&key=/path/to/server.key`
+2. Environment variables:
+   `HOLONS_WSS_CERT_FILE=/path/to/server.crt`
+   `HOLONS_WSS_KEY_FILE=/path/to/server.key`
+   then listen with `wss://127.0.0.1:8443/grpc`
+
 ## Holon-RPC (Browser & WebSocket Gateway)
 
 Two server implementations, same wire protocol (JSON-RPC 2.0, `holon-rpc`
