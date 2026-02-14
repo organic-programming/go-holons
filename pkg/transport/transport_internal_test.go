@@ -146,7 +146,6 @@ func TestStdioConnMethods(t *testing.T) {
 	c := &stdioConn{
 		reader: bytes.NewBufferString("abc"),
 		writer: &writer,
-		done:   make(chan struct{}),
 	}
 
 	buf := make([]byte, 3)
@@ -187,6 +186,36 @@ func TestStdioConnMethods(t *testing.T) {
 	}
 	if err := c.Close(); err != nil {
 		t.Fatalf("close twice: %v", err)
+	}
+}
+
+func TestStdioCloseConcurrentDoesNotPanic(t *testing.T) {
+	for i := 0; i < 2000; i++ {
+		l := newStdioListener()
+		conn, err := l.Accept()
+		if err != nil {
+			t.Fatalf("accept: %v", err)
+		}
+
+		done := make(chan struct{}, 2)
+		go func() {
+			_ = conn.Close()
+			done <- struct{}{}
+		}()
+		go func() {
+			_ = l.Close()
+			done <- struct{}{}
+		}()
+
+		<-done
+		<-done
+
+		if err := conn.Close(); err != nil {
+			t.Fatalf("close conn again: %v", err)
+		}
+		if err := l.Close(); err != nil {
+			t.Fatalf("close listener again: %v", err)
+		}
 	}
 }
 

@@ -77,9 +77,9 @@ func newStdioListener() *stdioListener {
 	}
 	// Deliver exactly one connection wrapping stdin/stdout.
 	l.connCh <- &stdioConn{
-		reader: os.Stdin,
-		writer: os.Stdout,
-		done:   l.done,
+		reader:        os.Stdin,
+		writer:        os.Stdout,
+		closeListener: l.shutdown,
 	}
 	return l
 }
@@ -99,11 +99,15 @@ func (l *stdioListener) Accept() (net.Conn, error) {
 }
 
 func (l *stdioListener) Close() error {
+	l.shutdown()
+	return nil
+}
+
+func (l *stdioListener) shutdown() {
 	l.once.Do(func() {
 		close(l.done)
 		close(l.connCh)
 	})
-	return nil
 }
 
 func (l *stdioListener) Addr() net.Addr {
@@ -112,19 +116,17 @@ func (l *stdioListener) Addr() net.Addr {
 
 // stdioConn wraps stdin/stdout as a net.Conn.
 type stdioConn struct {
-	reader io.Reader
-	writer io.Writer
-	done   chan struct{}
+	reader        io.Reader
+	writer        io.Writer
+	closeListener func()
 }
 
 func (c *stdioConn) Read(p []byte) (int, error)  { return c.reader.Read(p) }
 func (c *stdioConn) Write(p []byte) (int, error) { return c.writer.Write(p) }
 
 func (c *stdioConn) Close() error {
-	select {
-	case <-c.done:
-	default:
-		close(c.done)
+	if c.closeListener != nil {
+		c.closeListener()
 	}
 	return nil
 }
