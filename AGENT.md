@@ -52,6 +52,30 @@ The four packages map to the four phases of inter-holon communication:
 
 ---
 
+## ⚠️ Go Environment — MANDATORY
+
+This project uses a **specific Go installation**. Agents **MUST** use it
+for every `go` command — build, test, run, or vet. No exceptions.
+
+```bash
+export GOTOOLCHAIN=local
+export GOROOT=/Users/bpds/go/go1.25.1
+export PATH=/Users/bpds/go/go1.25.1/bin:$PATH
+```
+
+Before doing anything else, verify with:
+
+```bash
+go version   # must print: go version go1.25.1 darwin/arm64
+go env GOROOT  # must print: /Users/bpds/go/go1.25.1
+```
+
+**Never** use `/opt/homebrew/bin/go` or any other Go binary.
+**Never** let `GOTOOLCHAIN=auto` download or switch to a different version.
+If the versions do not match, **stop and ask the user**.
+
+---
+
 ## 2. `pkg/transport` — URI-based listener factory
 
 Parses a transport URI and returns a `net.Listener`. This is the
