@@ -5,7 +5,7 @@ author:
   name: "B. ALTER & Claude"
   copyright: "© 2026 Benoit Pereira da Silva"
 created: 2026-02-12
-revised: 2026-02-12
+revised: 2026-02-14
 lang: en-US
 origin_lang: en-US
 translation_of: null
@@ -32,20 +32,23 @@ implementations of the plumbing required by Constitution Article 11
 sdk/go-holons/
 ├── AGENT.md           ← you are here
 ├── README.md
+├── cert.json
 ├── go.mod / go.sum
 └── pkg/
     ├── transport/     ← URI → net.Listener factory
     ├── serve/         ← standard serve command
-    └── grpcclient/    ← transport-agnostic gRPC client
+    ├── grpcclient/    ← transport-agnostic gRPC client
+    └── holonrpc/      ← Holon-RPC client + server (JSON-RPC 2.0 over WebSocket)
 ```
 
-The three packages map to the three phases of inter-holon communication:
+The four packages map to the four phases of inter-holon communication:
 
 | Phase | Package | Who uses it |
 |-------|---------|-------------|
 | **Listen** | `transport` | The holon server |
 | **Serve** | `serve` | The holon's `serve` subcommand |
 | **Dial** | `grpcclient` | The holon client (or OP) |
+| **Holon-RPC** | `holonrpc` | Browser ↔ holon bidirectional RPC |
 
 ---
 
@@ -237,7 +240,92 @@ both ephemeral (call and kill) and long-running (reuse connection) patterns.
 
 ---
 
-## 5. Agent directives
+## 5. `pkg/holonrpc` — Holon-RPC client and server
+
+Implements PROTOCOL.md §4: JSON-RPC 2.0 over WebSocket with the
+`holon-rpc` subprotocol. Fully bidirectional — both client and server
+can initiate calls.
+
+### Client API
+
+```go
+import "github.com/Organic-Programming/go-holons/pkg/holonrpc"
+
+client := holonrpc.NewClient()
+
+// Register a handler for server-initiated calls (before or after connect).
+client.Register("client.v1.Client/Hello", func(ctx context.Context, params map[string]any) (map[string]any, error) {
+    return map[string]any{"greeting": "hello from client"}, nil
+})
+
+// Connect (one-shot — no automatic reconnect).
+err := client.Connect(ctx, "ws://localhost:8080/rpc")
+
+// Or connect with automatic reconnect (exponential backoff).
+err := client.ConnectWithReconnect(ctx, "ws://localhost:8080/rpc")
+
+// Invoke a server-side method.
+result, err := client.Invoke(ctx, "echo.v1.Echo/Ping", map[string]any{"message": "hello"})
+
+// Check connection state.
+if client.Connected() { /* ... */ }
+
+// Graceful close.
+client.Close()
+```
+
+### Server API
+
+```go
+server := holonrpc.NewServer("ws://127.0.0.1:0/rpc")
+
+// Register handlers for client-originated calls.
+server.Register("echo.v1.Echo/Ping", func(ctx context.Context, params map[string]any) (map[string]any, error) {
+    return map[string]any{"message": "pong"}, nil
+})
+
+// Start listening.
+addr, err := server.Start()
+
+// Wait for a client, then call into it (bidirectional).
+clientID, _ := server.WaitForClient(ctx)
+result, err := server.Invoke(ctx, clientID, "client.v1.Client/Hello", map[string]any{})
+
+// List connected clients.
+ids := server.ClientIDs()
+
+// Graceful shutdown.
+server.Close(ctx)
+```
+
+### Reconnect behavior
+
+When using `ConnectWithReconnect`, the client automatically:
+
+1. Detects disconnection via the read loop.
+2. Waits with exponential backoff (500ms → 30s, factor 2.0, 10% jitter).
+3. Reconnects and re-registers all handlers.
+4. Resumes normal operation — pending `Invoke` calls during disconnection
+   fail with `UNAVAILABLE` (code 14); calls after reconnection succeed.
+
+### ID namespacing
+
+- Client-originated IDs: `"c1"`, `"c2"`, ...
+- Server-originated IDs: `"s1"`, `"s2"`, ... (mandatory `s` prefix per PROTOCOL.md §4.6)
+
+### Error codes
+
+| Code | Meaning |
+|------|---------|
+| -32700 | Parse error |
+| -32600 | Invalid request |
+| -32601 | Method not found |
+| -32602 | Invalid params |
+| 14 | Unavailable (peer disconnected) |
+
+---
+
+## 6. Agent directives
 
 When creating a new Go holon:
 
@@ -259,13 +347,15 @@ When modifying this SDK:
 
 ---
 
-## 6. Relationship to the Constitution
+## 7. Relationship to the Constitution
 
 | Article | SDK implementation |
 |---------|-------------------|
 | Article 2 (gRPC + reflection) | `serve.Run` enables reflection by default |
+| Article 2 (Holon-RPC binding) | `holonrpc.Client` + `holonrpc.Server` implement §4 |
 | Article 11 (serve convention) | `serve.ParseFlags` + `serve.Run` |
 | Article 11 (mandatory transports) | `transport.Listen` supports `tcp://` and `stdio://` |
 | Article 11 (optional transports) | `transport.Listen` supports `unix://`, `mem://`, `ws://`, `wss://` |
 | Article 11 (backward compat) | `serve.ParseFlags` accepts `--port` |
 | Article 11 (SIGTERM) | `serve.Run` installs signal handlers |
+| Article 11 (bidirectional) | `holonrpc` supports symmetric calls in both directions |

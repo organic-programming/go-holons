@@ -5,7 +5,7 @@ author:
   name: "B. ALTER"
   copyright: "© 2026 Benoit Pereira da Silva"
 created: 2026-02-12
-revised: 2026-02-13
+revised: 2026-02-14
 lang: en-US
 origin_lang: en-US
 translation_of: null
@@ -45,9 +45,11 @@ This is **not** a holon. It is a library. Holons import it.
 ## WebBridge (Browser Gateway)
 
 The `transport.WebBridge` is a Go-only feature that lets browser clients
-invoke holon methods over WebSocket using a simple JSON envelope protocol.
-No third-party wire format (gRPC-Web, Connect) is introduced — the bridge
-translates JSON ↔ handler calls entirely in-process.
+communicate with a holon over WebSocket using Holon-RPC (JSON-RPC 2.0,
+`holon-rpc` subprotocol). Calls are **bidirectional** — the browser can
+call holon methods, and the holon can call methods registered in the
+browser. No third-party wire format (gRPC-Web, Connect) is introduced —
+the bridge translates JSON ↔ handler calls entirely in-process.
 
 ```
 ┌──────────────┐   WebSocket       ┌──────────────────────────────────┐
@@ -77,13 +79,17 @@ mux.HandleFunc("/ws", bridge.HandleWebSocket)
 http.ListenAndServe(":8080", mux)
 ```
 
-### Wire Protocol
+### Wire Protocol (Holon-RPC)
 
 | Direction | Format |
 |-----------|--------|
-| Browser → Server | `{ "jsonrpc":"2.0", "id":"1", "method":"pkg.Service/Method", "params": {...} }` |
-| Server → Browser (success) | `{ "jsonrpc":"2.0", "id":"1", "result": {...} }` |
-| Server → Browser (error) | `{ "jsonrpc":"2.0", "id":"1", "error": { "code": -32601, "message": "..." } }` |
+| Client → Server | `{ "jsonrpc":"2.0", "id":"c1", "method":"pkg.Service/Method", "params": {...} }` |
+| Server → Client (response) | `{ "jsonrpc":"2.0", "id":"c1", "result": {...} }` |
+| Server → Client (error) | `{ "jsonrpc":"2.0", "id":"c1", "error": { "code": -32601, "message": "..." } }` |
+| Server → Client (call) | `{ "jsonrpc":"2.0", "id":"s1", "method":"client.v1/Info", "params": {...} }` |
+| Client → Server (response) | `{ "jsonrpc":"2.0", "id":"s1", "result": {...} }` |
+
+Server-originated IDs use the `s` prefix per PROTOCOL.md §4.6.
 
 ## Quality Gates
 
