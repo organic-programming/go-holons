@@ -101,6 +101,11 @@ var echoServiceDesc = grpc.ServiceDesc{
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "serve" {
+		// Compatibility with grpcclient.DialStdio helper processes.
+		os.Args = append([]string{os.Args[0]}, os.Args[2:]...)
+	}
+
 	opts := parseFlags()
 
 	lis, err := transport.Listen(opts.listenURI)

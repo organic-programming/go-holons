@@ -761,7 +761,7 @@ func TestWebBridgeMalformedJSONPayloads(t *testing.T) {
 		{
 			name:     "invalid-envelope-field-type",
 			message:  `{"jsonrpc":"2.0","id":"e1","method":123,"params":{}}`,
-			wantCode: -32700,
+			wantCode: -32600,
 		},
 		{
 			name:     "malformed-handler-payload-shape",
@@ -923,7 +923,7 @@ func TestWebBridgeMarshalResponseFailure(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected error response, got: %v", resp)
 	}
-	if errObj["code"].(float64) != 13 {
-		t.Fatalf("error code = %v, want 13", errObj["code"])
+	if errObj["code"].(float64) != -32603 {
+		t.Fatalf("error code = %v, want -32603", errObj["code"])
 	}
 }

@@ -186,9 +186,15 @@ func (b *WebBridge) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 		var msg wsMsg
 		if err := json.Unmarshal(data, &msg); err != nil {
+			code := -32700
+			message := "parse error"
+			if json.Valid(data) {
+				code = -32600
+				message = "invalid request"
+			}
 			resp := marshalWsResp(wsMsg{
 				JSONRPC: "2.0",
-				Error:   &wsErr{Code: -32700, Message: "parse error"},
+				Error:   &wsErr{Code: code, Message: message},
 			})
 			c.Write(ctx, websocket.MessageText, resp)
 			continue
@@ -358,6 +364,9 @@ func (b *WebBridge) handleRequest(ctx context.Context, conn *WebConn, msg wsMsg)
 			if we, ok := err.(*WebError); ok {
 				code = we.Code
 				errMsg = we.Message
+			} else {
+				code = -32603
+				errMsg = "internal error"
 			}
 			resp.Error = &wsErr{Code: code, Message: errMsg}
 		} else {
@@ -396,7 +405,7 @@ func marshalWsResp(r wsMsg) []byte {
 	data, err := json.Marshal(r)
 	if err != nil {
 		log.Printf("wsweb: marshal response id=%q: %v", r.ID, err)
-		return []byte(`{"jsonrpc":"2.0","error":{"code":13,"message":"internal marshal error"}}`)
+		return []byte(`{"jsonrpc":"2.0","error":{"code":-32603,"message":"internal error"}}`)
 	}
 	return data
 }

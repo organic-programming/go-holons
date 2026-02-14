@@ -69,14 +69,9 @@ func TestListenVariantsAndUnsupported(t *testing.T) {
 	}
 	_ = wsLis.Close()
 
-	wssLis, err := Listen("wss://127.0.0.1:0/grpc")
-	if err != nil {
-		t.Fatalf("listen wss: %v", err)
+	if _, err := Listen("wss://127.0.0.1:0/grpc"); err == nil {
+		t.Fatal("expected wss listen error without cert/key")
 	}
-	if !strings.HasPrefix(wssLis.Addr().String(), "wss://") {
-		t.Fatalf("wss addr = %q, want wss:// prefix", wssLis.Addr().String())
-	}
-	_ = wssLis.Close()
 
 	if _, err := Listen("bad://host"); err == nil {
 		t.Fatal("expected unsupported URI error")

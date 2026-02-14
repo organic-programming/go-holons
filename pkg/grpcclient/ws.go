@@ -19,25 +19,17 @@ import (
 // "holon-rpc": this transport carries raw gRPC HTTP/2 bytes inside binary
 // WebSocket frames, while holon-rpc is JSON-RPC 2.0 over text frames.
 func DialWebSocket(ctx context.Context, uri string) (*grpc.ClientConn, error) {
-	// Connect WebSocket
-	c, _, err := websocket.Dial(ctx, uri, &websocket.DialOptions{
-		Subprotocols: []string{"grpc"},
-	})
-	if err != nil {
-		return nil, fmt.Errorf("websocket dial %s: %w", uri, err)
-	}
-
-	// Wrap as net.Conn
-	wsConn := websocket.NetConn(ctx, c, websocket.MessageBinary)
-
-	// Single-use dialer — the WebSocket connection is already established
-	dialed := false
-	dialer := func(_ context.Context, _ string) (net.Conn, error) {
-		if dialed {
-			return nil, fmt.Errorf("ws connection already consumed")
+	// Each gRPC transport dial gets its own WebSocket connection.
+	// This keeps reconnect paths functional instead of failing on
+	// "connection already consumed" after the first attempt.
+	dialer := func(ctx context.Context, _ string) (net.Conn, error) {
+		c, _, err := websocket.Dial(ctx, uri, &websocket.DialOptions{
+			Subprotocols: []string{"grpc"},
+		})
+		if err != nil {
+			return nil, fmt.Errorf("websocket dial %s: %w", uri, err)
 		}
-		dialed = true
-		return wsConn, nil
+		return websocket.NetConn(context.Background(), c, websocket.MessageBinary), nil
 	}
 
 	//nolint:staticcheck // DialContext is deprecated but needed for single-connection transports.
@@ -48,7 +40,6 @@ func DialWebSocket(ctx context.Context, uri string) (*grpc.ClientConn, error) {
 		grpc.WithBlock(),
 	)
 	if err != nil {
-		wsConn.Close()
 		return nil, fmt.Errorf("grpc handshake over ws: %w", err)
 	}
 

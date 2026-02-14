@@ -370,7 +370,12 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 		var msg rpcMessage
 		if err := json.Unmarshal(data, &msg); err != nil {
-			_ = s.sendPeerError(peer, json.RawMessage("null"), codeParseError, "parse error", nil)
+			code := classifyDecodeError(data)
+			message := "invalid request"
+			if code == codeParseError {
+				message = "parse error"
+			}
+			_ = s.sendPeerError(peer, json.RawMessage("null"), code, message, nil)
 			continue
 		}
 
@@ -448,7 +453,7 @@ func (s *Server) handlePeerRequest(peer *serverPeer, msg rpcMessage) {
 			_ = s.sendPeerError(peer, reqID, rpcErr.Code, rpcErr.Message, rpcErr.Data)
 			return
 		}
-		_ = s.sendPeerError(peer, reqID, 13, err.Error(), nil)
+		_ = s.sendPeerError(peer, reqID, codeInternalError, "internal error", nil)
 		return
 	}
 

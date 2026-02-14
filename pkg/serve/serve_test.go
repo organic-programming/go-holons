@@ -5,10 +5,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
+	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -19,6 +23,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	testgrpc "google.golang.org/grpc/interop/grpc_testing"
+	"google.golang.org/grpc/metadata"
 	reflectionv1alpha "google.golang.org/grpc/reflection/grpc_reflection_v1alpha"
 	"google.golang.org/grpc/status"
 )
@@ -31,17 +36,55 @@ func (s *serveEchoServer) EmptyCall(context.Context, *testgrpc.Empty) (*testgrpc
 	return &testgrpc.Empty{}, nil
 }
 
-func (s *serveEchoServer) UnaryCall(_ context.Context, in *testgrpc.SimpleRequest) (*testgrpc.SimpleResponse, error) {
+func (s *serveEchoServer) UnaryCall(ctx context.Context, in *testgrpc.SimpleRequest) (*testgrpc.SimpleResponse, error) {
 	payload := in.GetPayload()
 	if payload == nil {
 		payload = &testgrpc.Payload{Type: testgrpc.PayloadType_COMPRESSABLE, Body: []byte("echo")}
 	}
+
+	_ = grpc.SetHeader(ctx, metadata.Pairs("x-holon", "go-holons"))
+	_ = grpc.SetTrailer(ctx, metadata.Pairs("x-holon-trailer", "done"))
+
+	if delay := parseSleepMillis(payload.GetBody()); delay > 0 {
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+
 	return &testgrpc.SimpleResponse{
 		Payload: &testgrpc.Payload{
 			Type: payload.GetType(),
 			Body: append([]byte(nil), payload.GetBody()...),
 		},
 	}, nil
+}
+
+func (s *serveEchoServer) FullDuplexCall(stream testgrpc.TestService_FullDuplexCallServer) error {
+	for {
+		req, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		payload := req.GetPayload()
+		if payload == nil {
+			payload = &testgrpc.Payload{Type: testgrpc.PayloadType_COMPRESSABLE, Body: []byte{}}
+		}
+		if err := stream.Send(&testgrpc.StreamingOutputCallResponse{
+			Payload: &testgrpc.Payload{
+				Type: payload.GetType(),
+				Body: append([]byte(nil), payload.GetBody()...),
+			},
+		}); err != nil {
+			return err
+		}
+	}
 }
 
 func TestServeHelperProcess(t *testing.T) {
@@ -96,6 +139,36 @@ func TestRunServesGRPCOnRandomPort(t *testing.T) {
 	defer conn.Close()
 
 	requireUnaryEchoEventually(t, conn, "serve-run")
+	requireStreamEchoEventually(t, conn, []string{"serve-stream-1", "serve-stream-2"})
+}
+
+func TestRunServesGRPCOnUnixSocket(t *testing.T) {
+	socketPath := filepath.Join(os.TempDir(), fmt.Sprintf("serve-%d.sock", time.Now().UnixNano()))
+	t.Cleanup(func() { _ = os.Remove(socketPath) })
+
+	listenURI := "unix://" + socketPath
+	cmd, logs := startServeProcess(t, "run", listenURI, false)
+	defer stopServeProcess(t, cmd, logs)
+
+	conn := dialServeAndWait(t, listenURI)
+	defer conn.Close()
+
+	requireUnaryEchoEventually(t, conn, "serve-unix")
+	requireStreamEchoEventually(t, conn, []string{"serve-unix-stream-1", "serve-unix-stream-2"})
+}
+
+func TestRunServesGRPCOnWebSocket(t *testing.T) {
+	port := freeTCPPort(t)
+	listenURI := fmt.Sprintf("ws://127.0.0.1:%d/grpc", port)
+
+	cmd, logs := startServeProcess(t, "run", listenURI, false)
+	defer stopServeProcess(t, cmd, logs)
+
+	conn := dialServeWebSocketAndWait(t, listenURI)
+	defer conn.Close()
+
+	requireUnaryEchoEventually(t, conn, "serve-ws")
+	requireStreamEchoEventually(t, conn, []string{"serve-ws-stream-1", "serve-ws-stream-2"})
 }
 
 func TestParseFlags(t *testing.T) {
@@ -197,6 +270,168 @@ func TestRunGracefulShutdownOnContextCancellation(t *testing.T) {
 			t.Fatalf("expected RPC to fail after graceful shutdown")
 		}
 	}
+}
+
+func TestRunGracefulShutdownWithInFlightRPC(t *testing.T) {
+	port := freeTCPPort(t)
+	listenURI := fmt.Sprintf("tcp://127.0.0.1:%d", port)
+	address := fmt.Sprintf("127.0.0.1:%d", port)
+
+	cmd, logs := startServeProcess(t, "run", listenURI, false)
+	conn := dialServeAndWait(t, address)
+	defer conn.Close()
+
+	inFlightErrCh := make(chan error, 1)
+	go func() {
+		callCtx, callCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer callCancel()
+		_, invokeErr := unaryEcho(callCtx, conn, "sleep-ms:1200")
+		inFlightErrCh <- invokeErr
+	}()
+
+	time.Sleep(150 * time.Millisecond)
+	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		stopServeProcess(t, cmd, logs)
+		t.Fatalf("signal serve helper: %v", err)
+	}
+	if err := waitProcessExit(cmd, 5*time.Second); err != nil {
+		stopServeProcess(t, cmd, logs)
+		t.Fatalf("serve helper did not exit gracefully: %v\nlogs:\n%s", err, logs.String())
+	}
+
+	select {
+	case invokeErr := <-inFlightErrCh:
+		if invokeErr == nil {
+			return
+		}
+		code := status.Code(invokeErr)
+		if code == codes.Unavailable || code == codes.Canceled || code == codes.DeadlineExceeded {
+			return
+		}
+		t.Fatalf("unexpected in-flight RPC error: %v", invokeErr)
+	case <-time.After(3 * time.Second):
+		t.Fatal("in-flight RPC did not finish during shutdown")
+	}
+}
+
+func TestRunConcurrentClients(t *testing.T) {
+	const clients = 10
+
+	port := freeTCPPort(t)
+	listenURI := fmt.Sprintf("tcp://127.0.0.1:%d", port)
+	address := fmt.Sprintf("127.0.0.1:%d", port)
+
+	cmd, logs := startServeProcess(t, "run", listenURI, false)
+	defer stopServeProcess(t, cmd, logs)
+
+	conns := make([]*grpc.ClientConn, 0, clients)
+	for i := 0; i < clients; i++ {
+		conn := dialServeAndWait(t, address)
+		conns = append(conns, conn)
+	}
+	defer func() {
+		for _, conn := range conns {
+			_ = conn.Close()
+		}
+	}()
+
+	errCh := make(chan error, clients)
+	var wg sync.WaitGroup
+	wg.Add(clients)
+	for i := 0; i < clients; i++ {
+		i := i
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			want := fmt.Sprintf("c-%d", i)
+			got, err := unaryEcho(ctx, conns[i], want)
+			if err != nil {
+				errCh <- err
+				return
+			}
+			if got != want {
+				errCh <- fmt.Errorf("echo mismatch: got %q want %q", got, want)
+			}
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestRunMetadataHeadersAndTrailers(t *testing.T) {
+	port := freeTCPPort(t)
+	listenURI := fmt.Sprintf("tcp://127.0.0.1:%d", port)
+	address := fmt.Sprintf("127.0.0.1:%d", port)
+
+	cmd, logs := startServeProcess(t, "run", listenURI, false)
+	defer stopServeProcess(t, cmd, logs)
+
+	conn := dialServeAndWait(t, address)
+	defer conn.Close()
+
+	client := testgrpc.NewTestServiceClient(conn)
+	var header metadata.MD
+	var trailer metadata.MD
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, err := client.UnaryCall(
+		ctx,
+		&testgrpc.SimpleRequest{
+			Payload: &testgrpc.Payload{
+				Type: testgrpc.PayloadType_COMPRESSABLE,
+				Body: []byte("metadata-probe"),
+			},
+		},
+		grpc.Header(&header),
+		grpc.Trailer(&trailer),
+	)
+	if err != nil {
+		t.Fatalf("unary metadata call: %v", err)
+	}
+
+	if got := header.Get("x-holon"); len(got) == 0 || got[0] != "go-holons" {
+		t.Fatalf("header x-holon = %v, want [go-holons]", got)
+	}
+	if got := trailer.Get("x-holon-trailer"); len(got) == 0 || got[0] != "done" {
+		t.Fatalf("trailer x-holon-trailer = %v, want [done]", got)
+	}
+}
+
+func TestRunRejectsOversizedMessage(t *testing.T) {
+	port := freeTCPPort(t)
+	listenURI := fmt.Sprintf("tcp://127.0.0.1:%d", port)
+	address := fmt.Sprintf("127.0.0.1:%d", port)
+
+	cmd, logs := startServeProcess(t, "run", listenURI, false)
+	defer stopServeProcess(t, cmd, logs)
+
+	conn := dialServeAndWait(t, address)
+	defer conn.Close()
+
+	client := testgrpc.NewTestServiceClient(conn)
+	oversized := bytes.Repeat([]byte("a"), 5*1024*1024)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	_, err := client.UnaryCall(ctx, &testgrpc.SimpleRequest{
+		Payload: &testgrpc.Payload{
+			Type: testgrpc.PayloadType_COMPRESSABLE,
+			Body: oversized,
+		},
+	})
+	if status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("expected RESOURCE_EXHAUSTED, got %v (%v)", status.Code(err), err)
+	}
+
+	requireUnaryEchoEventually(t, conn, "post-oversize")
 }
 
 func startServeProcess(t *testing.T, mode, listenURI string, reflectEnabled bool) (*exec.Cmd, *bytes.Buffer) {
@@ -389,4 +624,69 @@ func unaryEcho(ctx context.Context, conn *grpc.ClientConn, msg string) (string, 
 		return "", err
 	}
 	return string(resp.GetPayload().GetBody()), nil
+}
+
+func requireStreamEchoEventually(t *testing.T, conn *grpc.ClientConn, messages []string) {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	client := testgrpc.NewTestServiceClient(conn)
+	stream, err := client.FullDuplexCall(ctx)
+	if err != nil {
+		t.Fatalf("full duplex call: %v", err)
+	}
+
+	for _, msg := range messages {
+		if err := stream.Send(&testgrpc.StreamingOutputCallRequest{
+			Payload: &testgrpc.Payload{
+				Type: testgrpc.PayloadType_COMPRESSABLE,
+				Body: []byte(msg),
+			},
+		}); err != nil {
+			t.Fatalf("stream send %q: %v", msg, err)
+		}
+		resp, err := stream.Recv()
+		if err != nil {
+			t.Fatalf("stream recv %q: %v", msg, err)
+		}
+		if got := string(resp.GetPayload().GetBody()); got != msg {
+			t.Fatalf("stream echo mismatch: got %q want %q", got, msg)
+		}
+	}
+	if err := stream.CloseSend(); err != nil {
+		t.Fatalf("stream close send: %v", err)
+	}
+}
+
+func dialServeWebSocketAndWait(t *testing.T, wsURI string) *grpc.ClientConn {
+	t.Helper()
+
+	deadline := time.Now().Add(6 * time.Second)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		ctx, cancel := context.WithTimeout(context.Background(), 600*time.Millisecond)
+		conn, err := grpcclient.DialWebSocket(ctx, wsURI)
+		cancel()
+		if err == nil {
+			return conn
+		}
+		lastErr = err
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("websocket server %s not ready: %v", wsURI, lastErr)
+	return nil
+}
+
+func parseSleepMillis(payload []byte) time.Duration {
+	const prefix = "sleep-ms:"
+	if !strings.HasPrefix(string(payload), prefix) {
+		return 0
+	}
+	millis, err := strconv.Atoi(strings.TrimPrefix(string(payload), prefix))
+	if err != nil || millis <= 0 {
+		return 0
+	}
+	return time.Duration(millis) * time.Millisecond
 }

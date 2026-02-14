@@ -322,6 +322,50 @@ func TestHolonRPCParseError(t *testing.T) {
 	requireWireErrorCode(t, resp, -32700)
 }
 
+func TestHolonRPCInvalidRequestEnvelopeShape(t *testing.T) {
+	_, addr := startHolonRPCServer(t, nil)
+	ws := dialRawHolonRPC(t, addr)
+	defer ws.CloseNow()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := ws.Write(ctx, websocket.MessageText, []byte(`{"jsonrpc":"2.0","id":"bad-shape","method":123,"params":{}}`)); err != nil {
+		t.Fatalf("write invalid request envelope: %v", err)
+	}
+
+	resp := readWSJSONMap(t, ws, 2*time.Second)
+	requireWireErrorCode(t, resp, -32600)
+}
+
+func TestHolonRPCBatchRequestUnsupported(t *testing.T) {
+	_, addr := startHolonRPCServer(t, nil)
+	ws := dialRawHolonRPC(t, addr)
+	defer ws.CloseNow()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := ws.Write(ctx, websocket.MessageText, []byte(`[{"jsonrpc":"2.0","id":"1","method":"rpc.heartbeat","params":{}}]`)); err != nil {
+		t.Fatalf("write batch request: %v", err)
+	}
+
+	resp := readWSJSONMap(t, ws, 2*time.Second)
+	requireWireErrorCode(t, resp, -32600)
+}
+
+func TestHolonRPCInternalErrorCode(t *testing.T) {
+	_, addr := startHolonRPCServer(t, func(s *holonrpc.Server) {
+		s.Register("boom.v1.Service/Crash", func(_ context.Context, _ map[string]any) (map[string]any, error) {
+			return nil, errors.New("boom")
+		})
+	})
+	client := connectHolonRPCClient(t, addr)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, err := client.Invoke(ctx, "boom.v1.Service/Crash", map[string]any{})
+	requireRPCErrorCode(t, err, -32603)
+}
+
 func TestHolonRPCServerUnregister(t *testing.T) {
 	_, addr := startHolonRPCServer(t, func(s *holonrpc.Server) {
 		s.Register("echo.v1.Echo/Ping", func(_ context.Context, params map[string]any) (map[string]any, error) {

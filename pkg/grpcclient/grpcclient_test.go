@@ -1,12 +1,15 @@
 package grpcclient_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -16,7 +19,9 @@ import (
 	"github.com/Organic-Programming/go-holons/pkg/transport"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	testgrpc "google.golang.org/grpc/interop/grpc_testing"
+	"google.golang.org/grpc/status"
 )
 
 type echoTestServer struct {
@@ -27,17 +32,52 @@ func (s *echoTestServer) EmptyCall(context.Context, *testgrpc.Empty) (*testgrpc.
 	return &testgrpc.Empty{}, nil
 }
 
-func (s *echoTestServer) UnaryCall(_ context.Context, in *testgrpc.SimpleRequest) (*testgrpc.SimpleResponse, error) {
+func (s *echoTestServer) UnaryCall(ctx context.Context, in *testgrpc.SimpleRequest) (*testgrpc.SimpleResponse, error) {
 	payload := in.GetPayload()
 	if payload == nil {
 		payload = &testgrpc.Payload{Type: testgrpc.PayloadType_COMPRESSABLE, Body: []byte("echo")}
 	}
+
+	if delay := parseSleepMillis(payload.GetBody()); delay > 0 {
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+
 	return &testgrpc.SimpleResponse{
 		Payload: &testgrpc.Payload{
 			Type: payload.GetType(),
 			Body: append([]byte(nil), payload.GetBody()...),
 		},
 	}, nil
+}
+
+func (s *echoTestServer) FullDuplexCall(stream testgrpc.TestService_FullDuplexCallServer) error {
+	for {
+		req, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		payload := req.GetPayload()
+		if payload == nil {
+			payload = &testgrpc.Payload{Type: testgrpc.PayloadType_COMPRESSABLE, Body: []byte{}}
+		}
+		if err := stream.Send(&testgrpc.StreamingOutputCallResponse{
+			Payload: &testgrpc.Payload{
+				Type: payload.GetType(),
+				Body: append([]byte(nil), payload.GetBody()...),
+			},
+		}); err != nil {
+			return err
+		}
+	}
 }
 
 func TestMain(m *testing.M) {
@@ -73,6 +113,7 @@ func TestDialTCPRoundTrip(t *testing.T) {
 	t.Cleanup(func() { _ = conn.Close() })
 
 	requireUnaryEchoEventually(t, conn, "tcp-echo")
+	requireStreamEcho(t, conn, []string{"tcp-s1", "tcp-s2"})
 }
 
 func TestDialUnixRoundTrip(t *testing.T) {
@@ -93,6 +134,7 @@ func TestDialUnixRoundTrip(t *testing.T) {
 	t.Cleanup(func() { _ = conn.Close() })
 
 	requireUnaryEchoEventually(t, conn, "unix-echo")
+	requireStreamEcho(t, conn, []string{"unix-s1", "unix-s2"})
 }
 
 func TestDialMemRoundTrip(t *testing.T) {
@@ -109,6 +151,7 @@ func TestDialMemRoundTrip(t *testing.T) {
 	t.Cleanup(func() { _ = conn.Close() })
 
 	requireUnaryEchoEventually(t, conn, "mem-echo")
+	requireStreamEcho(t, conn, []string{"mem-s1", "mem-s2"})
 }
 
 func TestDialWebSocketRoundTrip(t *testing.T) {
@@ -136,6 +179,7 @@ func TestDialWebSocketRoundTrip(t *testing.T) {
 	t.Cleanup(func() { _ = conn.Close() })
 
 	requireUnaryEchoEventually(t, conn, "ws-echo")
+	requireStreamEcho(t, conn, []string{"ws-s1", "ws-s2"})
 }
 
 func TestDialErrorCases(t *testing.T) {
@@ -205,6 +249,153 @@ func TestDialStdioIntegration(t *testing.T) {
 	})
 
 	requireUnaryEchoEventually(t, conn, "stdio-echo")
+	requireStreamEcho(t, conn, []string{"stdio-s1", "stdio-s2"})
+}
+
+func TestDialUnary_ContextCancellation(t *testing.T) {
+	lis, err := transport.Listen("tcp://127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen tcp: %v", err)
+	}
+	startEchoGRPCServer(t, lis)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := grpcclient.Dial(ctx, lis.Addr().String())
+	if err != nil {
+		t.Fatalf("dial tcp: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	callCtx, callCancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		_, invokeErr := unaryEcho(callCtx, conn, "sleep-ms:1500")
+		errCh <- invokeErr
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	callCancel()
+
+	select {
+	case invokeErr := <-errCh:
+		if invokeErr == nil {
+			t.Fatal("expected cancellation error")
+		}
+		if code := status.Code(invokeErr); code != codes.Canceled && !errors.Is(invokeErr, context.Canceled) {
+			t.Fatalf("expected canceled status, got %v (%v)", code, invokeErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for canceled RPC")
+	}
+}
+
+func TestDialUnary_DeadlinePropagation(t *testing.T) {
+	lis, err := transport.Listen("tcp://127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen tcp: %v", err)
+	}
+	startEchoGRPCServer(t, lis)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := grpcclient.Dial(ctx, lis.Addr().String())
+	if err != nil {
+		t.Fatalf("dial tcp: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	callCtx, callCancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer callCancel()
+	start := time.Now()
+	_, invokeErr := unaryEcho(callCtx, conn, "sleep-ms:1500")
+	if invokeErr == nil {
+		t.Fatal("expected deadline exceeded error")
+	}
+	if code := status.Code(invokeErr); code != codes.DeadlineExceeded && !errors.Is(invokeErr, context.DeadlineExceeded) {
+		t.Fatalf("expected deadline exceeded status, got %v (%v)", code, invokeErr)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("deadline propagation too slow: %v", elapsed)
+	}
+}
+
+func TestDial_ReconnectAfterServerRestart(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen tcp: %v", err)
+	}
+	addr := lis.Addr().String()
+
+	srv1 := grpc.NewServer()
+	testgrpc.RegisterTestServiceServer(srv1, &echoTestServer{})
+	errCh1 := make(chan error, 1)
+	go func() {
+		errCh1 <- srv1.Serve(lis)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := grpcclient.Dial(ctx, addr)
+	if err != nil {
+		t.Fatalf("dial tcp: %v", err)
+	}
+	defer conn.Close()
+
+	requireUnaryEchoEventually(t, conn, "before-restart")
+
+	srv1.Stop()
+	select {
+	case <-errCh1:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for first server shutdown")
+	}
+
+	lis2, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatalf("relisten tcp: %v", err)
+	}
+	defer lis2.Close()
+
+	srv2 := grpc.NewServer()
+	testgrpc.RegisterTestServiceServer(srv2, &echoTestServer{})
+	errCh2 := make(chan error, 1)
+	go func() {
+		errCh2 <- srv2.Serve(lis2)
+	}()
+	defer func() {
+		srv2.Stop()
+		select {
+		case <-errCh2:
+		case <-time.After(2 * time.Second):
+			t.Fatal("timeout waiting for second server shutdown")
+		}
+	}()
+
+	requireUnaryEchoEventually(t, conn, "after-restart")
+}
+
+func TestDial_NonExistentServerReturnsUnavailable(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	conn, err := grpcclient.Dial(ctx, "127.0.0.1:1")
+	if err != nil {
+		t.Fatalf("dial unexpectedly failed: %v", err)
+	}
+	defer conn.Close()
+
+	rpcCtx, rpcCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer rpcCancel()
+
+	_, err = unaryEcho(rpcCtx, conn, "hello")
+	if err == nil {
+		t.Fatal("expected unavailable RPC error")
+	}
+	code := status.Code(err)
+	if code != codes.Unavailable && code != codes.DeadlineExceeded {
+		t.Fatalf("unexpected code for unreachable server: %v (%v)", code, err)
+	}
 }
 
 func TestDialStdioInvalidBinary(t *testing.T) {
@@ -313,4 +504,53 @@ func unaryEcho(ctx context.Context, conn *grpc.ClientConn, msg string) (string, 
 		return "", err
 	}
 	return string(resp.GetPayload().GetBody()), nil
+}
+
+func requireStreamEcho(t *testing.T, conn *grpc.ClientConn, messages []string) {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	client := testgrpc.NewTestServiceClient(conn)
+	stream, err := client.FullDuplexCall(ctx)
+	if err != nil {
+		t.Fatalf("full duplex call: %v", err)
+	}
+
+	for _, msg := range messages {
+		if err := stream.Send(&testgrpc.StreamingOutputCallRequest{
+			Payload: &testgrpc.Payload{
+				Type: testgrpc.PayloadType_COMPRESSABLE,
+				Body: []byte(msg),
+			},
+		}); err != nil {
+			t.Fatalf("stream send %q: %v", msg, err)
+		}
+
+		resp, err := stream.Recv()
+		if err != nil {
+			t.Fatalf("stream recv %q: %v", msg, err)
+		}
+		got := string(resp.GetPayload().GetBody())
+		if got != msg {
+			t.Fatalf("stream echo mismatch: got %q want %q", got, msg)
+		}
+	}
+
+	if err := stream.CloseSend(); err != nil {
+		t.Fatalf("stream close send: %v", err)
+	}
+}
+
+func parseSleepMillis(payload []byte) time.Duration {
+	const prefix = "sleep-ms:"
+	if !bytes.HasPrefix(payload, []byte(prefix)) {
+		return 0
+	}
+	millis, err := strconv.Atoi(strings.TrimPrefix(string(payload), prefix))
+	if err != nil || millis <= 0 {
+		return 0
+	}
+	return time.Duration(millis) * time.Millisecond
 }

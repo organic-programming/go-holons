@@ -12,6 +12,7 @@
 package transport
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -34,9 +35,21 @@ func Listen(uri string) (net.Listener, error) {
 
 	case strings.HasPrefix(uri, "unix://"):
 		path := strings.TrimPrefix(uri, "unix://")
+		if strings.TrimSpace(path) == "" {
+			return nil, fmt.Errorf("unix transport URI %q is missing socket path", uri)
+		}
 		// Clean up stale socket files
-		os.Remove(path) //nolint:errcheck
-		return net.Listen("unix", path)
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("remove stale unix socket %q: %w", path, err)
+		}
+		lis, err := net.Listen("unix", path)
+		if err != nil {
+			return nil, err
+		}
+		return &unixListener{
+			Listener: lis,
+			path:     path,
+		}, nil
 
 	case uri == "stdio://" || uri == "stdio":
 		return newStdioListener(), nil
@@ -71,14 +84,18 @@ type stdioListener struct {
 }
 
 func newStdioListener() *stdioListener {
+	return newStdioListenerWithIO(os.Stdin, os.Stdout)
+}
+
+func newStdioListenerWithIO(reader io.Reader, writer io.Writer) *stdioListener {
 	l := &stdioListener{
 		connCh: make(chan net.Conn, 1),
 		done:   make(chan struct{}),
 	}
 	// Deliver exactly one connection wrapping stdin/stdout.
 	l.connCh <- &stdioConn{
-		reader:        os.Stdin,
-		writer:        os.Stdout,
+		reader:        reader,
+		writer:        writer,
 		closeListener: l.shutdown,
 	}
 	return l
@@ -141,3 +158,22 @@ type stdioAddr struct{}
 
 func (stdioAddr) Network() string { return "stdio" }
 func (stdioAddr) String() string  { return "stdio://" }
+
+type unixListener struct {
+	net.Listener
+	path string
+	once sync.Once
+}
+
+func (l *unixListener) Close() error {
+	var closeErr error
+	l.once.Do(func() {
+		closeErr = l.Listener.Close()
+		if err := os.Remove(l.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			if closeErr == nil {
+				closeErr = err
+			}
+		}
+	})
+	return closeErr
+}

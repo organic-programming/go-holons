@@ -348,6 +348,149 @@ func TestHolonRPCReconnect(t *testing.T) {
 	}
 }
 
+func TestHolonRPC_MessageOrderingByRequestID(t *testing.T) {
+	_, addr := startHolonRPCServer(t, func(s *holonrpc.Server) {
+		s.Register("echo.v1.Echo/Ping", func(_ context.Context, params map[string]any) (map[string]any, error) {
+			if rawDelay, ok := params["delay_ms"].(float64); ok && rawDelay > 0 {
+				time.Sleep(time.Duration(rawDelay) * time.Millisecond)
+			}
+			return map[string]any{"id": params["id"]}, nil
+		})
+	})
+
+	client := connectHolonRPCClient(t, addr)
+
+	const calls = 20
+	errCh := make(chan error, calls)
+	var wg sync.WaitGroup
+	wg.Add(calls)
+
+	for i := 0; i < calls; i++ {
+		i := i
+		go func() {
+			defer wg.Done()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+
+			resp, err := client.Invoke(ctx, "echo.v1.Echo/Ping", map[string]any{
+				"id":       i,
+				"delay_ms": float64((calls - i) * 5),
+			})
+			if err != nil {
+				errCh <- err
+				return
+			}
+			got, ok := resp["id"].(float64)
+			if !ok {
+				errCh <- fmt.Errorf("missing id field in response: %#v", resp)
+				return
+			}
+			if int(got) != i {
+				errCh <- fmt.Errorf("response id mismatch: got %d want %d", int(got), i)
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestHolonRPC_LargePayloadNearLimit(t *testing.T) {
+	_, addr := startHolonRPCServer(t, func(s *holonrpc.Server) {
+		s.Register("echo.v1.Echo/Ping", func(_ context.Context, params map[string]any) (map[string]any, error) {
+			return params, nil
+		})
+	})
+
+	client := connectHolonRPCClient(t, addr)
+	nearLimit := strings.Repeat("x", 900*1024)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	resp, err := client.Invoke(ctx, "echo.v1.Echo/Ping", map[string]any{"message": nearLimit})
+	if err != nil {
+		t.Fatalf("invoke near-limit payload: %v", err)
+	}
+	got, _ := resp["message"].(string)
+	if got != nearLimit {
+		t.Fatalf("near-limit payload mismatch: got len %d want len %d", len(got), len(nearLimit))
+	}
+}
+
+func TestHolonRPC_OversizedMessageRejection(t *testing.T) {
+	_, addr := startHolonRPCServer(t, func(s *holonrpc.Server) {
+		s.Register("echo.v1.Echo/Ping", func(_ context.Context, params map[string]any) (map[string]any, error) {
+			return params, nil
+		})
+	})
+
+	ws := dialRawHolonRPC(t, addr)
+	defer ws.CloseNow()
+
+	oversized := strings.Repeat("a", 2*1024*1024)
+	req, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      "big-1",
+		"method":  "echo.v1.Echo/Ping",
+		"params":  map[string]string{"message": oversized},
+	})
+	if err != nil {
+		t.Fatalf("marshal oversized request: %v", err)
+	}
+
+	readErrCh := make(chan error, 1)
+	go func() {
+		readCtx, readCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer readCancel()
+		_, _, readErr := ws.Read(readCtx)
+		readErrCh <- readErr
+	}()
+
+	writeCtx, writeCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	writer, err := ws.Writer(writeCtx, websocket.MessageText)
+	if err != nil {
+		writeCancel()
+		t.Fatalf("open oversized writer: %v", err)
+	}
+
+	const chunk = 16 * 1024
+	for off := 0; off < len(req); off += chunk {
+		end := off + chunk
+		if end > len(req) {
+			end = len(req)
+		}
+		if _, err := writer.Write(req[off:end]); err != nil {
+			break
+		}
+	}
+	_ = writer.Close()
+	writeCancel()
+
+	var readErr error
+	select {
+	case readErr = <-readErrCh:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for oversize close frame")
+	}
+	if status := websocket.CloseStatus(readErr); status != websocket.StatusMessageTooBig {
+		t.Fatalf("close status = %v, want %v (err=%v)", status, websocket.StatusMessageTooBig, readErr)
+	}
+
+	// Server should remain healthy after rejecting oversize payloads.
+	probeClient := connectHolonRPCClient(t, addr)
+	probeCtx, probeCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer probeCancel()
+	if _, err := probeClient.Invoke(probeCtx, "rpc.heartbeat", nil); err != nil {
+		t.Fatalf("heartbeat after oversize rejection failed: %v", err)
+	}
+}
+
 func reserveHolonRPCBindURL(t *testing.T) string {
 	t.Helper()
 

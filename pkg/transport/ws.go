@@ -6,6 +6,8 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -19,15 +21,42 @@ import (
 // URI format: ws://<host>:<port>[/path] or wss://<host>:<port>[/path]
 // The path defaults to "/grpc" if omitted.
 func newWSListener(uri string) (net.Listener, error) {
-	isTLS := strings.HasPrefix(uri, "wss://")
-	trimmed := strings.TrimPrefix(strings.TrimPrefix(uri, "wss://"), "ws://")
+	parsed, err := url.Parse(uri)
+	if err != nil {
+		return nil, fmt.Errorf("parse websocket URI %q: %w", uri, err)
+	}
 
-	// Split addr from path
-	addr := trimmed
-	path := "/grpc"
-	if i := strings.Index(trimmed, "/"); i >= 0 {
-		addr = trimmed[:i]
-		path = trimmed[i:]
+	scheme := strings.ToLower(parsed.Scheme)
+	isTLS := scheme == "wss"
+	if scheme != "ws" && scheme != "wss" {
+		return nil, fmt.Errorf("unsupported websocket scheme %q", parsed.Scheme)
+	}
+
+	addr := parsed.Host
+	if strings.TrimSpace(addr) == "" {
+		return nil, fmt.Errorf("websocket URI %q is missing host:port", uri)
+	}
+	if _, _, err := net.SplitHostPort(addr); err != nil {
+		return nil, fmt.Errorf("invalid websocket host:port %q: %w", addr, err)
+	}
+
+	path := parsed.Path
+	if path == "" {
+		path = "/grpc"
+	}
+
+	certFile := parsed.Query().Get("cert")
+	keyFile := parsed.Query().Get("key")
+	if isTLS {
+		if certFile == "" {
+			certFile = os.Getenv("HOLONS_WSS_CERT_FILE")
+		}
+		if keyFile == "" {
+			keyFile = os.Getenv("HOLONS_WSS_KEY_FILE")
+		}
+		if certFile == "" || keyFile == "" {
+			return nil, fmt.Errorf("wss:// requires cert and key (query params cert/key or HOLONS_WSS_CERT_FILE/HOLONS_WSS_KEY_FILE)")
+		}
 	}
 
 	// Bind the TCP listener first so we fail fast on port conflicts
@@ -55,10 +84,7 @@ func newWSListener(uri string) (net.Listener, error) {
 	go func() {
 		var err error
 		if isTLS {
-			// TLS: caller must provide cert/key via environment or
-			// the standard crypto/tls configuration. For now, we
-			// require plain WS; TLS can be added via a reverse proxy.
-			err = wsl.server.ServeTLS(tcpLis, "", "")
+			err = wsl.server.ServeTLS(tcpLis, certFile, keyFile)
 		} else {
 			err = wsl.server.Serve(tcpLis)
 		}

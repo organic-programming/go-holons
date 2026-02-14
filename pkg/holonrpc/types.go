@@ -159,3 +159,13 @@ func marshalMessage(msg rpcMessage) ([]byte, error) {
 	}
 	return out, nil
 }
+
+// classifyDecodeError returns protocol-level JSON-RPC error codes for
+// malformed wire envelopes. Valid JSON with an invalid envelope shape maps
+// to Invalid Request; invalid JSON text maps to Parse Error.
+func classifyDecodeError(raw []byte) int {
+	if json.Valid(raw) {
+		return codeInvalidRequest
+	}
+	return codeParseError
+}

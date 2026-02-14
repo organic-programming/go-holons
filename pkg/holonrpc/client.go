@@ -326,7 +326,12 @@ func (c *Client) readLoop(ws *websocket.Conn, done chan struct{}) {
 
 		var msg rpcMessage
 		if err := json.Unmarshal(data, &msg); err != nil {
-			_ = c.sendError(ws, c.rxCtx, json.RawMessage("null"), codeParseError, "parse error", nil)
+			code := classifyDecodeError(data)
+			message := "invalid request"
+			if code == codeParseError {
+				message = "parse error"
+			}
+			_ = c.sendError(ws, c.rxCtx, json.RawMessage("null"), code, message, nil)
 			continue
 		}
 
@@ -562,7 +567,7 @@ func (c *Client) handleRequest(ws *websocket.Conn, ctx context.Context, msg rpcM
 			_ = c.sendError(ws, ctx, reqID, rpcErr.Code, rpcErr.Message, rpcErr.Data)
 			return
 		}
-		_ = c.sendError(ws, ctx, reqID, 13, err.Error(), nil)
+		_ = c.sendError(ws, ctx, reqID, codeInternalError, "internal error", nil)
 		return
 	}
 
