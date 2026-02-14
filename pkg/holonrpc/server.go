@@ -502,7 +502,8 @@ func (s *Server) handlePeerResponse(peer *serverPeer, msg rpcMessage) {
 func (s *Server) sendPeerResult(peer *serverPeer, id json.RawMessage, result map[string]any) error {
 	resultRaw, err := marshalObject(result)
 	if err != nil {
-		return err
+		// Framework-level marshal failure → JSON-RPC internal error (§5.2).
+		return s.sendPeerError(peer, id, codeInternalError, "internal error", nil)
 	}
 
 	msg, err := marshalMessage(rpcMessage{
@@ -511,7 +512,7 @@ func (s *Server) sendPeerResult(peer *serverPeer, id json.RawMessage, result map
 		Result:  resultRaw,
 	})
 	if err != nil {
-		return err
+		return s.sendPeerError(peer, id, codeInternalError, "internal error", nil)
 	}
 	return s.writePeer(peer, msg)
 }

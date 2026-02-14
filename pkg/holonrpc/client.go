@@ -601,7 +601,8 @@ func (c *Client) handleResponse(msg rpcMessage) {
 func (c *Client) sendResult(ws *websocket.Conn, ctx context.Context, id json.RawMessage, result map[string]any) error {
 	resultRaw, err := marshalObject(result)
 	if err != nil {
-		return err
+		// Framework-level marshal failure → JSON-RPC internal error (§5.2).
+		return c.sendError(ws, ctx, id, codeInternalError, "internal error", nil)
 	}
 
 	data, err := marshalMessage(rpcMessage{
@@ -610,7 +611,7 @@ func (c *Client) sendResult(ws *websocket.Conn, ctx context.Context, id json.Raw
 		Result:  resultRaw,
 	})
 	if err != nil {
-		return err
+		return c.sendError(ws, ctx, id, codeInternalError, "internal error", nil)
 	}
 	return c.write(ws, ctx, data)
 }

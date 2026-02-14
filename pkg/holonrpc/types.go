@@ -17,12 +17,13 @@ import (
 
 const jsonRPCVersion = "2.0"
 
-// JSON-RPC reserved error codes.
+// JSON-RPC reserved error codes (PROTOCOL.md §5.2).
 const (
 	codeParseError     = -32700
 	codeInvalidRequest = -32600
 	codeMethodNotFound = -32601
 	codeInvalidParams  = -32602
+	codeInternalError  = -32603
 )
 
 // Common gRPC-style transport/runtime code used by the SDK for disconnected
