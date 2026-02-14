@@ -217,9 +217,18 @@ func (b *WebBridge) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 			}
 			// Incoming request from browser → dispatch to Go handler
 			go b.handleRequest(ctx, conn, msg)
-		} else {
+		} else if len(msg.Result) > 0 || msg.Error != nil {
 			// Incoming response from browser → route to pending Invoke()
 			conn.handleResponse(msg)
+		} else if strings.TrimSpace(msg.ID) != "" {
+			resp := marshalWsResp(wsMsg{
+				JSONRPC: "2.0",
+				ID:      msg.ID,
+				Error:   &wsErr{Code: -32600, Message: "invalid request"},
+			})
+			conn.mu.Lock()
+			_ = c.Write(ctx, websocket.MessageText, resp)
+			conn.mu.Unlock()
 		}
 	}
 }

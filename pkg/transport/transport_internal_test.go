@@ -97,6 +97,22 @@ func TestWSListenerHTTPUpgradeFailure(t *testing.T) {
 	}
 }
 
+func TestWSListenerAcceptAfterCloseReturnsEOF(t *testing.T) {
+	lis, err := Listen("ws://127.0.0.1:0/grpc")
+	if err != nil {
+		t.Fatalf("listen ws: %v", err)
+	}
+
+	if err := lis.Close(); err != nil {
+		t.Fatalf("close ws listener: %v", err)
+	}
+
+	_, err = lis.Accept()
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("accept after close error = %v, want io.EOF", err)
+	}
+}
+
 func TestStdioListenerAcceptAndClose(t *testing.T) {
 	l := newStdioListener()
 

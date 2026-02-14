@@ -20,6 +20,38 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
+type blockingStreamService interface {
+	Block(grpc.ServerStream) error
+}
+
+type blockingStreamServer struct {
+	started chan struct{}
+}
+
+func (s *blockingStreamServer) Block(stream grpc.ServerStream) error {
+	select {
+	case s.started <- struct{}{}:
+	default:
+	}
+	<-stream.Context().Done()
+	return stream.Context().Err()
+}
+
+var blockingStreamServiceDesc = grpc.ServiceDesc{
+	ServiceName: "test.v1.Blocking",
+	HandlerType: (*blockingStreamService)(nil),
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName: "Block",
+			Handler: func(srv interface{}, stream grpc.ServerStream) error {
+				return srv.(blockingStreamService).Block(stream)
+			},
+			ServerStreams: true,
+			ClientStreams: true,
+		},
+	},
+}
+
 func TestMain(m *testing.M) {
 	if len(os.Args) > 1 && os.Args[1] == "serve" {
 		main()
@@ -225,6 +257,197 @@ func TestServerHelpers(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("shutdown did not return")
+	}
+}
+
+func TestEchoServiceDescHandler_InterceptorAndDecodeError(t *testing.T) {
+	if len(echoServiceDesc.Methods) != 1 {
+		t.Fatalf("unexpected method count: %d", len(echoServiceDesc.Methods))
+	}
+	method := echoServiceDesc.Methods[0]
+	svc := server{sdk: "sdk", version: "1.0.0"}
+
+	_, err := method.Handler(
+		svc,
+		context.Background(),
+		func(interface{}) error { return errors.New("decode failure") },
+		nil,
+	)
+	if err == nil || !strings.Contains(err.Error(), "decode failure") {
+		t.Fatalf("expected decode failure, got: %v", err)
+	}
+
+	interceptorCalled := false
+	resp, err := method.Handler(
+		svc,
+		context.Background(),
+		func(in interface{}) error {
+			req, ok := in.(*PingRequest)
+			if !ok {
+				t.Fatalf("decoder received unexpected request type: %T", in)
+			}
+			req.Message = "intercepted"
+			return nil
+		},
+		func(
+			ctx context.Context,
+			req interface{},
+			info *grpc.UnaryServerInfo,
+			handler grpc.UnaryHandler,
+		) (interface{}, error) {
+			interceptorCalled = true
+			if info.FullMethod != "/echo.v1.Echo/Ping" {
+				t.Fatalf("unexpected full method: %s", info.FullMethod)
+			}
+			return handler(ctx, req)
+		},
+	)
+	if err != nil {
+		t.Fatalf("handler with interceptor failed: %v", err)
+	}
+	if !interceptorCalled {
+		t.Fatal("interceptor was not called")
+	}
+
+	out, ok := resp.(*PingResponse)
+	if !ok {
+		t.Fatalf("unexpected response type: %T", resp)
+	}
+	if out.Message != "intercepted" || out.SDK != "sdk" || out.Version != "1.0.0" {
+		t.Fatalf("unexpected interceptor response: %#v", out)
+	}
+}
+
+func TestShutdown_ForceStopAfterTimeout(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen tcp: %v", err)
+	}
+	defer lis.Close()
+
+	started := make(chan struct{}, 1)
+	grpcServer := grpc.NewServer()
+	grpcServer.RegisterService(&blockingStreamServiceDesc, &blockingStreamServer{started: started})
+
+	serveErrCh := make(chan error, 1)
+	go func() {
+		serveErrCh <- grpcServer.Serve(lis)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	conn, err := grpc.DialContext(
+		ctx,
+		lis.Addr().String(),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithBlock(),
+	)
+	if err != nil {
+		t.Fatalf("dial grpc server: %v", err)
+	}
+	defer conn.Close()
+
+	streamCtx, streamCancel := context.WithCancel(context.Background())
+	defer streamCancel()
+	streamDesc := &grpc.StreamDesc{
+		StreamName:    "Block",
+		ServerStreams: true,
+		ClientStreams: true,
+	}
+	stream, err := conn.NewStream(streamCtx, streamDesc, "/test.v1.Blocking/Block")
+	if err != nil {
+		t.Fatalf("open blocking stream: %v", err)
+	}
+	defer stream.CloseSend()
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("blocking stream handler did not start")
+	}
+
+	start := time.Now()
+	shutdown(grpcServer)
+	elapsed := time.Since(start)
+	if elapsed < 1900*time.Millisecond {
+		t.Fatalf("shutdown elapsed=%v, expected force-stop timeout path", elapsed)
+	}
+
+	select {
+	case err := <-serveErrCh:
+		if err != nil && !errors.Is(err, grpc.ErrServerStopped) && !strings.Contains(err.Error(), "closed network connection") {
+			t.Fatalf("grpc server exit error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for grpc server shutdown")
+	}
+}
+
+func TestMain_GracefulSignalPath(t *testing.T) {
+	oldArgs := os.Args
+	oldFlags := flag.CommandLine
+	defer func() {
+		os.Args = oldArgs
+		flag.CommandLine = oldFlags
+	}()
+
+	os.Args = []string{"echo-server", "--listen", "tcp://127.0.0.1:0"}
+	flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
+	flag.CommandLine.SetOutput(ioDiscard{})
+
+	done := make(chan struct{})
+	go func() {
+		main()
+		close(done)
+	}()
+
+	time.Sleep(200 * time.Millisecond)
+	proc, err := os.FindProcess(os.Getpid())
+	if err != nil {
+		t.Fatalf("find current process: %v", err)
+	}
+	if err := proc.Signal(syscall.SIGTERM); err != nil {
+		t.Fatalf("signal current process: %v", err)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("main did not return after SIGTERM")
+	}
+}
+
+func TestMain_ServeAliasSignalPath(t *testing.T) {
+	oldArgs := os.Args
+	oldFlags := flag.CommandLine
+	defer func() {
+		os.Args = oldArgs
+		flag.CommandLine = oldFlags
+	}()
+
+	os.Args = []string{"echo-server", "serve", "--listen", "tcp://127.0.0.1:0"}
+	flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
+	flag.CommandLine.SetOutput(ioDiscard{})
+
+	done := make(chan struct{})
+	go func() {
+		main()
+		close(done)
+	}()
+
+	time.Sleep(200 * time.Millisecond)
+	proc, err := os.FindProcess(os.Getpid())
+	if err != nil {
+		t.Fatalf("find current process: %v", err)
+	}
+	if err := proc.Signal(syscall.SIGTERM); err != nil {
+		t.Fatalf("signal current process: %v", err)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("main did not return after SIGTERM")
 	}
 }
 

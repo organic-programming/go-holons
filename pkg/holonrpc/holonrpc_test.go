@@ -337,6 +337,21 @@ func TestHolonRPCInvalidRequestEnvelopeShape(t *testing.T) {
 	requireWireErrorCode(t, resp, -32600)
 }
 
+func TestHolonRPCInvalidRequestMissingMethod(t *testing.T) {
+	_, addr := startHolonRPCServer(t, nil)
+	ws := dialRawHolonRPC(t, addr)
+	defer ws.CloseNow()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := ws.Write(ctx, websocket.MessageText, []byte(`{"jsonrpc":"2.0","id":"missing-method","params":{"x":1}}`)); err != nil {
+		t.Fatalf("write invalid request envelope: %v", err)
+	}
+
+	resp := readWSJSONMap(t, ws, 2*time.Second)
+	requireWireErrorCode(t, resp, -32600)
+}
+
 func TestHolonRPCBatchRequestUnsupported(t *testing.T) {
 	_, addr := startHolonRPCServer(t, nil)
 	ws := dialRawHolonRPC(t, addr)
@@ -364,6 +379,27 @@ func TestHolonRPCInternalErrorCode(t *testing.T) {
 	defer cancel()
 	_, err := client.Invoke(ctx, "boom.v1.Service/Crash", map[string]any{})
 	requireRPCErrorCode(t, err, -32603)
+}
+
+func TestHolonRPCMethodNotFoundErrorContainsMethodName(t *testing.T) {
+	_, addr := startHolonRPCServer(t, nil)
+	client := connectHolonRPCClient(t, addr)
+
+	method := "does.not.Exist/Method"
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, err := client.Invoke(ctx, method, map[string]any{})
+
+	var rpcErr *holonrpc.ResponseError
+	if !errors.As(err, &rpcErr) {
+		t.Fatalf("expected ResponseError, got %T: %v", err, err)
+	}
+	if rpcErr.Code != -32601 {
+		t.Fatalf("error code = %d, want -32601", rpcErr.Code)
+	}
+	if !strings.Contains(rpcErr.Message, method) {
+		t.Fatalf("error message = %q, want to contain %q", rpcErr.Message, method)
+	}
 }
 
 func TestHolonRPCServerUnregister(t *testing.T) {
@@ -480,6 +516,70 @@ func TestHolonRPCConnectWithReconnectInitialDialFailure(t *testing.T) {
 	}
 	if strings.Contains(invokeErr.Error(), "connection closed") {
 		t.Fatalf("expected no reconnect loop after initial failure, got: %v", invokeErr)
+	}
+}
+
+func TestHolonRPCClientRejectsMissingSubprotocolNegotiation(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+			InsecureSkipVerify: true,
+		})
+		if err != nil {
+			return
+		}
+		defer c.CloseNow()
+
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	client := holonrpc.NewClient()
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	err := client.Connect(ctx, wsURL)
+	if err == nil {
+		t.Fatal("expected connect failure when holon-rpc subprotocol is not negotiated")
+	}
+	if !strings.Contains(err.Error(), "did not negotiate holon-rpc") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestHolonRPCNullIDNotification(t *testing.T) {
+	called := make(chan struct{}, 1)
+	_, addr := startHolonRPCServer(t, func(s *holonrpc.Server) {
+		s.Register("notify.v1.Notify/Send", func(_ context.Context, params map[string]any) (map[string]any, error) {
+			if params["value"] == "null-id" {
+				called <- struct{}{}
+			}
+			return map[string]any{"ok": true}, nil
+		})
+	})
+
+	ws := dialRawHolonRPC(t, addr)
+	defer ws.CloseNow()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	req := []byte(`{"jsonrpc":"2.0","id":null,"method":"notify.v1.Notify/Send","params":{"value":"null-id"}}`)
+	if err := ws.Write(ctx, websocket.MessageText, req); err != nil {
+		t.Fatalf("write null-id notification: %v", err)
+	}
+
+	select {
+	case <-called:
+	case <-time.After(2 * time.Second):
+		t.Fatal("null-id notification handler was not called")
+	}
+
+	readCtx, readCancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer readCancel()
+	_, _, err := ws.Read(readCtx)
+	if !errors.Is(err, context.DeadlineExceeded) && !strings.Contains(err.Error(), "closed network connection") {
+		t.Fatalf("expected no response for null-id notification, got: %v", err)
 	}
 }
 

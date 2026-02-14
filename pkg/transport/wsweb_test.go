@@ -290,6 +290,24 @@ func TestWebBridgeInvalidJSON(t *testing.T) {
 	}
 }
 
+func TestWebBridgeInvalidRequestMissingMethod(t *testing.T) {
+	bridge := transport.NewWebBridge()
+	srv := httptest.NewServer(bridge)
+	defer srv.Close()
+
+	c := dialTestBridge(t, srv)
+	defer c.CloseNow()
+
+	resp := roundTrip(t, c, `{"jsonrpc":"2.0","id":"bad-req","params":{"x":1}}`)
+	errObj, ok := resp["error"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected error response, got: %v", resp)
+	}
+	if errObj["code"].(float64) != -32600 {
+		t.Fatalf("code = %v, want -32600", errObj["code"])
+	}
+}
+
 func TestWebBridgeHeartbeatCompatibility(t *testing.T) {
 	bridge := transport.NewWebBridge()
 	srv := httptest.NewServer(bridge)
