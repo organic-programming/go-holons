@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -435,5 +436,65 @@ func TestHolonRPCConnectWithReconnectInitialDialFailure(t *testing.T) {
 	}
 	if strings.Contains(invokeErr.Error(), "connection closed") {
 		t.Fatalf("expected no reconnect loop after initial failure, got: %v", invokeErr)
+	}
+}
+
+func TestValenceMultiConcurrent(t *testing.T) {
+	_, addr := startHolonRPCServer(t, func(s *holonrpc.Server) {
+		s.Register("echo.v1.Echo/Ping", func(_ context.Context, params map[string]any) (map[string]any, error) {
+			// Add small work so the test fails if requests are serialized.
+			time.Sleep(300 * time.Millisecond)
+			return params, nil
+		})
+	})
+
+	const clients = 5
+	start := make(chan struct{})
+	errCh := make(chan error, clients)
+	var wg sync.WaitGroup
+	wg.Add(clients)
+
+	for i := 0; i < clients; i++ {
+		i := i
+		go func() {
+			defer wg.Done()
+			<-start
+
+			client := holonrpc.NewClient()
+			defer client.Close()
+
+			connectCtx, connectCancel := context.WithTimeout(context.Background(), 2*time.Second)
+			if err := client.Connect(connectCtx, addr); err != nil {
+				connectCancel()
+				errCh <- fmt.Errorf("client %d connect: %w", i, err)
+				return
+			}
+			connectCancel()
+
+			callCtx, callCancel := context.WithTimeout(context.Background(), 900*time.Millisecond)
+			resp, err := client.Invoke(callCtx, "echo.v1.Echo/Ping", map[string]any{"message": fmt.Sprintf("c-%d", i)})
+			callCancel()
+			if err != nil {
+				errCh <- fmt.Errorf("client %d invoke: %w", i, err)
+				return
+			}
+
+			want := fmt.Sprintf("c-%d", i)
+			got, _ := resp["message"].(string)
+			if got != want {
+				errCh <- fmt.Errorf("client %d mismatch: got %q want %q", i, got, want)
+				return
+			}
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 }

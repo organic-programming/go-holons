@@ -802,6 +802,81 @@ func TestWebBridgeMalformedJSONPayloads(t *testing.T) {
 	}
 }
 
+func TestMessageSizeRejection(t *testing.T) {
+	bridge := transport.NewWebBridge()
+	bridge.Register("echo.v1.Echo/Ping", func(_ context.Context, payload json.RawMessage) (json.RawMessage, error) {
+		return payload, nil
+	})
+
+	srv := httptest.NewServer(bridge)
+	defer srv.Close()
+
+	oversizeConn := dialTestBridge(t, srv)
+	defer oversizeConn.CloseNow()
+
+	oversized := strings.Repeat("a", 2*1024*1024)
+	req, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      "big-1",
+		"method":  "echo.v1.Echo/Ping",
+		"params":  map[string]string{"message": oversized},
+	})
+	if err != nil {
+		t.Fatalf("marshal oversized request: %v", err)
+	}
+
+	readErrCh := make(chan error, 1)
+	go func() {
+		readCtx, readCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer readCancel()
+		_, _, readErr := oversizeConn.Read(readCtx)
+		readErrCh <- readErr
+	}()
+
+	writeCtx, writeCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	writer, err := oversizeConn.Writer(writeCtx, websocket.MessageText)
+	if err != nil {
+		writeCancel()
+		t.Fatalf("open oversized writer: %v", err)
+	}
+
+	const chunk = 16 * 1024
+	for off := 0; off < len(req); off += chunk {
+		end := off + chunk
+		if end > len(req) {
+			end = len(req)
+		}
+		if _, err := writer.Write(req[off:end]); err != nil {
+			break
+		}
+	}
+	_ = writer.Close()
+	writeCancel()
+
+	var readErr error
+	select {
+	case readErr = <-readErrCh:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for oversize close frame")
+	}
+	if status := websocket.CloseStatus(readErr); status != websocket.StatusMessageTooBig {
+		t.Fatalf("close status = %v, want %v (err=%v)", status, websocket.StatusMessageTooBig, readErr)
+	}
+
+	// The server must stay healthy after rejecting the oversized frame.
+	probeConn := dialTestBridge(t, srv)
+	defer probeConn.CloseNow()
+	resp := roundTrip(t, probeConn, `{"jsonrpc":"2.0","id":"ok-1","method":"echo.v1.Echo/Ping","params":{"message":"ok"}}`)
+
+	result, ok := resp["result"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected success response after oversize rejection, got: %v", resp)
+	}
+	if got, _ := result["message"].(string); got != "ok" {
+		t.Fatalf("post-rejection echo mismatch: got %q want %q", got, "ok")
+	}
+}
+
 func TestWebBridgeAllowOrigins(t *testing.T) {
 	bridge := transport.NewWebBridge()
 	bridge.AllowOrigins("allowed.example")
