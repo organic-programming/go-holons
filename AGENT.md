@@ -125,6 +125,68 @@ connections and presents them as `net.Conn` to the gRPC server. Uses
 - **NAT traversal**: works through firewalls on port 80/443
 - **No proxy needed**: unlike gRPC-Web, this tunnels raw gRPC frames over WS
 
+### WebBridge — embeddable Holon-RPC gateway
+
+`transport.WebBridge` is the **server-side gateway** that makes a Go holon
+accessible from browsers over Holon-RPC (JSON-RPC 2.0 + `holon-rpc` subprotocol).
+
+Unlike `holonrpc.Server` (§5), which owns its own TCP listener, WebBridge
+**embeds into an existing `http.ServeMux`** — enabling a single HTTP server
+to serve static files, REST endpoints, and Holon-RPC simultaneously.
+
+```
+┌──────────────┐   WebSocket       ┌──────────────────────────────────┐
+│  Browser     │  ws://:8080/rpc   │  Go Holon                        │
+│  js-web-     │ ◄──────────────►  │  ┌──────────┐   ┌─────────────┐ │
+│  holons      │  holon-rpc sub-   │  │ WebBridge │   │ gRPC server │ │
+│  (client)    │  protocol         │  │ (JSON/WS) │   │ (standard)  │ │
+└──────────────┘                   │  └──────────┘   └─────────────┘ │
+                                   └──────────────────────────────────┘
+```
+
+#### API
+
+```go
+import "github.com/Organic-Programming/go-holons/pkg/transport"
+
+bridge := transport.NewWebBridge()
+
+// Register handlers for browser → Go calls.
+bridge.Register("hello.v1.HelloService/Greet",
+    func(ctx context.Context, params json.RawMessage) (json.RawMessage, error) {
+        // ...
+        return json.Marshal(result)
+    },
+)
+
+// Callback when a browser connects — use conn to call browser methods.
+bridge.OnConnect(func(conn *transport.WebConn) {
+    result, err := conn.InvokeWithTimeout("ui.v1.UIService/GetViewport", nil, 5*time.Second)
+})
+
+// CORS restriction (omit for development).
+bridge.AllowOrigins("https://example.com")
+
+// Mount on an existing HTTP server.
+mux := http.NewServeMux()
+mux.HandleFunc("/ws", bridge.HandleWebSocket)
+mux.Handle("/", http.FileServer(http.Dir("static")))
+http.ListenAndServe(":8080", mux)
+```
+
+#### When to use WebBridge vs holonrpc.Server
+
+| | `transport.WebBridge` | `holonrpc.Server` (§5) |
+|--|---|---|
+| **Integration** | Embeds into existing HTTP server | Standalone (owns listener) |
+| **Use case** | Browser-facing holon with static files | Go-to-Go Holon-RPC, interop testing |
+| **Handler type** | `func(ctx, json.RawMessage) (json.RawMessage, error)` | `func(ctx, map[string]any) (map[string]any, error)` |
+| **Connect event** | `bridge.OnConnect(func(*WebConn))` | `server.WaitForClient(ctx)` |
+| **CORS** | `bridge.AllowOrigins(...)` | Not built-in |
+| **Wire protocol** | Identical — JSON-RPC 2.0 + `holon-rpc` subprotocol | Identical |
+
+Both follow [PROTOCOL.md §4](../../PROTOCOL.md#4-holon-rpc-binding) exactly.
+
 ---
 
 ## 3. `pkg/serve` — standard serve command

@@ -42,44 +42,46 @@ This is **not** a holon. It is a library. Holons import it.
 | `ws://<host>:<port>` | WebSocket (browser, NAT traversal) |
 | `wss://<host>:<port>` | WebSocket over TLS |
 
-## WebBridge (Browser Gateway)
+## Holon-RPC (Browser & WebSocket Gateway)
 
-The `transport.WebBridge` is a Go-only feature that lets browser clients
-communicate with a holon over WebSocket using Holon-RPC (JSON-RPC 2.0,
-`holon-rpc` subprotocol). Calls are **bidirectional** — the browser can
-call holon methods, and the holon can call methods registered in the
-browser. No third-party wire format (gRPC-Web, Connect) is introduced —
-the bridge translates JSON ↔ handler calls entirely in-process.
+Two server implementations, same wire protocol (JSON-RPC 2.0, `holon-rpc`
+subprotocol). Calls are **bidirectional** — the browser can call holon methods,
+and the holon can call methods registered in the browser. No third-party wire
+format (gRPC-Web, Connect) is introduced.
+
+### `transport.WebBridge` — embeddable (browser-facing)
+
+Mounts on an existing `http.ServeMux` alongside static files and REST.
+Used by [`examples/web-hello-world`](../../examples/web-hello-world/).
 
 ```
 ┌──────────────┐   WebSocket       ┌──────────────────────────────────┐
-│  Browser     │  ws://:8080/rpc   │  Go Holon                        │
+│  Browser     │  ws://:8080/ws    │  Go Holon                        │
 │  js-web-     │ ◄──────────────►  │  ┌──────────┐   ┌─────────────┐ │
-│  holons      │  holon-rpc sub-   │  │ holonrpc │   │ gRPC server │ │
-│  (client)    │  protocol         │  │ (JSON/WS)│   │ (standard)  │ │
+│  holons      │  holon-rpc sub-   │  │ WebBridge │   │ gRPC server │ │
+│  (client)    │  protocol         │  │ (JSON/WS) │   │ (standard)  │ │
 └──────────────┘                   │  └──────────┘   └─────────────┘ │
                                    └──────────────────────────────────┘
 ```
 
-### Usage (`pkg/holonrpc`)
-
 ```go
-import "github.com/Organic-Programming/go-holons/pkg/holonrpc"
-
-server := holonrpc.NewServer("ws://127.0.0.1:8080/rpc")
-
-server.Register("hello.v1.HelloService/Greet",
-    func(ctx context.Context, params map[string]any) (map[string]any, error) {
-        name, _ := params["name"].(string)
-        return map[string]any{"message": "Hello, " + name + "!"}, nil
-    },
-)
-
-server.Start()
-defer server.Close(context.Background())
+bridge := transport.NewWebBridge()
+bridge.Register("hello.v1.HelloService/Greet", handler)
+mux.HandleFunc("/ws", bridge.HandleWebSocket)
 ```
 
-See [AGENT.md §5](./AGENT.md#5-pkgholonrpc--holon-rpc-client-and-server) for full Client and Server API.
+### `holonrpc.Server` — standalone
+
+Owns its TCP listener. Used for Go-to-Go Holon-RPC and interop testing.
+
+```go
+server := holonrpc.NewServer("ws://127.0.0.1:8080/rpc")
+server.Register("hello.v1.HelloService/Greet", handler)
+server.Start()
+```
+
+See [AGENT.md §2](./AGENT.md#webbridge--embeddable-holon-rpc-gateway) for the
+comparison table and full API.
 
 ### Wire Protocol (Holon-RPC)
 

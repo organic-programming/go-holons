@@ -14,12 +14,17 @@ import (
 	"nhooyr.io/websocket"
 )
 
-// WebBridge provides a bidirectional Holon-RPC gateway
-// (JSON-RPC 2.0 over WebSocket).
+// WebBridge provides an embeddable bidirectional Holon-RPC gateway
+// (JSON-RPC 2.0 over WebSocket) that mounts on an existing [http.ServeMux].
+//
+// Use WebBridge when the holon serves both static files and Holon-RPC
+// from the same HTTP server (e.g. browser-facing applications).
+// For a standalone Holon-RPC server that owns its own listener, use
+// [holonrpc.Server] from pkg/holonrpc instead.
 //
 // Both sides can act as client and server simultaneously:
 //   - Browser calls Go:  browser sends a request, Go handler responds.
-//   - Go calls browser:  Go sends a request via WebConn.Invoke(), browser handler responds.
+//   - Go calls browser:  Go sends a request via [WebConn.Invoke], browser handler responds.
 //
 // Wire protocol (symmetric — either direction):
 //

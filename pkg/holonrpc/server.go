@@ -16,7 +16,12 @@ import (
 	"nhooyr.io/websocket"
 )
 
-// Server is a Holon-RPC server (JSON-RPC 2.0 over WebSocket).
+// Server is a standalone Holon-RPC server (JSON-RPC 2.0 over WebSocket).
+// It owns its own TCP listener and HTTP server.
+//
+// For embedding Holon-RPC in an existing HTTP server (e.g. alongside
+// static files in a browser-facing application), use
+// [transport.WebBridge] from pkg/transport instead.
 //
 // It supports bidirectional calls:
 //   - client -> server via Register handlers
