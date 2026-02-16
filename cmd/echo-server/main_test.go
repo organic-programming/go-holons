@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Organic-Programming/go-holons/pkg/grpcclient"
+	"github.com/organic-programming/go-holons/pkg/grpcclient"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )

@@ -20,7 +20,7 @@ status: draft
 Concrete integration patterns for developers and agents building Go holons.
 Each section is self-contained with copy-pastable code.
 
-> **Import path**: `github.com/Organic-Programming/go-holons/pkg/...`
+> **Import path**: `github.com/organic-programming/go-holons/pkg/...`
 
 ---
 
@@ -37,7 +37,7 @@ import (
     "os"
 
     pb "your-holon/gen/proto"
-    "github.com/Organic-Programming/go-holons/pkg/serve"
+    "github.com/organic-programming/go-holons/pkg/serve"
     "google.golang.org/grpc"
 )
 
@@ -65,7 +65,7 @@ go run . --listen stdio://
 ## 2. Connect to a Remote Holon (TCP / Unix)
 
 ```go
-import "github.com/Organic-Programming/go-holons/pkg/grpcclient"
+import "github.com/organic-programming/go-holons/pkg/grpcclient"
 
 // TCP
 conn, err := grpcclient.Dial(ctx, "localhost:9090")
@@ -88,7 +88,7 @@ Fork a holon binary and talk gRPC over pipes — no port, no socket, no network.
 The binary must support `serve --listen stdio://`.
 
 ```go
-import "github.com/Organic-Programming/go-holons/pkg/grpcclient"
+import "github.com/organic-programming/go-holons/pkg/grpcclient"
 
 conn, cmd, err := grpcclient.DialStdio(ctx, "/path/to/holon-binary")
 if err != nil {
@@ -114,7 +114,7 @@ Run server and client in the same process — ideal for composite holons and tes
 
 ```go
 import (
-    "github.com/Organic-Programming/go-holons/pkg/transport"
+    "github.com/organic-programming/go-holons/pkg/transport"
     "google.golang.org/grpc"
     "google.golang.org/grpc/credentials/insecure"
 )
@@ -154,7 +154,7 @@ s.Serve(lis)
 ### Client side
 
 ```go
-import "github.com/Organic-Programming/go-holons/pkg/grpcclient"
+import "github.com/organic-programming/go-holons/pkg/grpcclient"
 
 conn, err := grpcclient.DialWebSocket(ctx, "ws://192.168.1.42:8443/grpc")
 defer conn.Close()
@@ -176,7 +176,7 @@ Use this when both sides are Go but you want the Holon-RPC wire format
 ### Server
 
 ```go
-import "github.com/Organic-Programming/go-holons/pkg/holonrpc"
+import "github.com/organic-programming/go-holons/pkg/holonrpc"
 
 server := holonrpc.NewServer("ws://127.0.0.1:0/rpc")
 
@@ -192,7 +192,7 @@ defer server.Close(context.Background())
 ### Client
 
 ```go
-import "github.com/Organic-Programming/go-holons/pkg/holonrpc"
+import "github.com/organic-programming/go-holons/pkg/holonrpc"
 
 client := holonrpc.NewClient()
 
@@ -233,7 +233,7 @@ Mount Holon-RPC alongside static files on an existing `http.ServeMux`.
 This is the standard pattern for browser-facing holons.
 
 ```go
-import "github.com/Organic-Programming/go-holons/pkg/transport"
+import "github.com/organic-programming/go-holons/pkg/transport"
 
 bridge := transport.NewWebBridge()
 

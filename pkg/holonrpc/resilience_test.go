@@ -14,7 +14,7 @@ import (
 
 	"nhooyr.io/websocket"
 
-	"github.com/Organic-Programming/go-holons/pkg/holonrpc"
+	"github.com/organic-programming/go-holons/pkg/holonrpc"
 )
 
 func TestHolonRPCConcurrentLoad(t *testing.T) {

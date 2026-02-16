@@ -22,7 +22,7 @@ status: draft
 implementations of the plumbing required by Constitution Article 11
 (The Serve Convention). Holons import it; it does not run on its own.
 
-**Import path**: `github.com/Organic-Programming/go-holons/pkg/<package>`
+**Import path**: `github.com/organic-programming/go-holons/pkg/<package>`
 
 ---
 
@@ -85,7 +85,7 @@ not fit your needs.
 ### API
 
 ```go
-import "github.com/Organic-Programming/go-holons/pkg/transport"
+import "github.com/organic-programming/go-holons/pkg/transport"
 
 // Listen creates a net.Listener from a transport URI.
 lis, err := transport.Listen("tcp://:9090")        // TCP socket
@@ -171,7 +171,7 @@ to serve static files, REST endpoints, and Holon-RPC simultaneously.
 #### API
 
 ```go
-import "github.com/Organic-Programming/go-holons/pkg/transport"
+import "github.com/organic-programming/go-holons/pkg/transport"
 
 bridge := transport.NewWebBridge()
 
@@ -219,7 +219,7 @@ High-level helper implementing the full `serve` lifecycle. A holon needs
 three lines to be fully compliant with Article 11:
 
 ```go
-import "github.com/Organic-Programming/go-holons/pkg/serve"
+import "github.com/organic-programming/go-holons/pkg/serve"
 
 case "serve":
     listenURI := serve.ParseFlags(os.Args[2:])
@@ -278,7 +278,7 @@ Client-side helpers for connecting to holons via any transport.
 ### API
 
 ```go
-import "github.com/Organic-Programming/go-holons/pkg/grpcclient"
+import "github.com/organic-programming/go-holons/pkg/grpcclient"
 
 // Dial connects to an existing gRPC server.
 conn, err := grpcclient.Dial(ctx, "localhost:9090")        // TCP
@@ -339,7 +339,7 @@ client and server can initiate calls (§4.6).
 ### Client API
 
 ```go
-import "github.com/Organic-Programming/go-holons/pkg/holonrpc"
+import "github.com/organic-programming/go-holons/pkg/holonrpc"
 
 client := holonrpc.NewClient()
 

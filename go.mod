@@ -1,4 +1,4 @@
-module github.com/Organic-Programming/go-holons
+module github.com/organic-programming/go-holons
 
 go 1.24.0
 

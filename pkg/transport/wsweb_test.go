@@ -14,7 +14,7 @@ import (
 
 	"nhooyr.io/websocket"
 
-	"github.com/Organic-Programming/go-holons/pkg/transport"
+	"github.com/organic-programming/go-holons/pkg/transport"
 )
 
 // helper: dial a test server and return the WebSocket conn

@@ -17,8 +17,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Organic-Programming/go-holons/pkg/grpcclient"
-	"github.com/Organic-Programming/go-holons/pkg/serve"
+	"github.com/organic-programming/go-holons/pkg/grpcclient"
+	"github.com/organic-programming/go-holons/pkg/serve"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
