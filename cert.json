@@ -21,13 +21,11 @@
   },
   "executables": {
     "echo_client": "go run ./cmd/echo-client",
-    "echo_server": "go run ./cmd/echo-server",
-    "accum_client": "go run ./cmd/accum-client",
-    "accum_server": "go run ./cmd/accum-server"
+    "echo_server": "go run ./cmd/echo-server"
   },
   "lang": "go",
   "last_certified": {
-    "commit": "7e1d05912f040afa84abd7c6c2a425f37fbdde80",
+    "commit": "47c9fef623631a7a0b475d4c8df7272ec36dcdcf",
     "date": "2026-02-16",
     "level": 5
   },
