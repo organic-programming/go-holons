@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -108,6 +109,26 @@ func (s *Server) ClientIDs() []string {
 		out = append(out, id)
 	}
 	return out
+}
+
+func (s *Server) peersResult() []map[string]any {
+	s.peersMu.RLock()
+	ids := make([]string, 0, len(s.peers))
+	for id := range s.peers {
+		ids = append(ids, id)
+	}
+	s.peersMu.RUnlock()
+
+	sort.Strings(ids)
+
+	peers := make([]map[string]any, 0, len(ids))
+	for _, id := range ids {
+		peers = append(peers, map[string]any{
+			"id":      id,
+			"methods": []string{},
+		})
+	}
+	return peers
 }
 
 // WaitForClient blocks until a client is connected or ctx is cancelled.
@@ -416,6 +437,15 @@ func (s *Server) handlePeerRequest(peer *serverPeer, msg rpcMessage) {
 	if method == "rpc.heartbeat" {
 		if hasID(reqID) {
 			_ = s.sendPeerResult(peer, reqID, map[string]any{})
+		}
+		return
+	}
+
+	if method == "rpc.peers" {
+		if hasID(reqID) {
+			_ = s.sendPeerResult(peer, reqID, map[string]any{
+				"peers": s.peersResult(),
+			})
 		}
 		return
 	}

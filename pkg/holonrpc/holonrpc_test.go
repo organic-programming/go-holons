@@ -241,6 +241,67 @@ func TestHolonRPCHeartbeat(t *testing.T) {
 	}
 }
 
+func TestHolonRPCPeers(t *testing.T) {
+	server, addr := startHolonRPCServer(t, nil)
+	clientA := connectHolonRPCClient(t, addr)
+	_ = connectHolonRPCClient(t, addr)
+
+	waitCtx, cancelWait := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancelWait()
+
+	wantIDs := make(map[string]struct{}, 2)
+	for i := 0; i < 2; i++ {
+		id, err := server.WaitForClient(waitCtx)
+		if err != nil {
+			t.Fatalf("wait for client %d: %v", i+1, err)
+		}
+		wantIDs[id] = struct{}{}
+	}
+
+	callCtx, cancelCall := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancelCall()
+	result, err := clientA.Invoke(callCtx, "rpc.peers", map[string]any{})
+	if err != nil {
+		t.Fatalf("rpc.peers invoke: %v", err)
+	}
+
+	rawPeers, ok := result["peers"].([]any)
+	if !ok {
+		t.Fatalf("rpc.peers result peers has type %T, want []any", result["peers"])
+	}
+	if len(rawPeers) != 2 {
+		t.Fatalf("rpc.peers count = %d, want 2", len(rawPeers))
+	}
+
+	gotIDs := make(map[string]struct{}, len(rawPeers))
+	for _, rawPeer := range rawPeers {
+		peer, ok := rawPeer.(map[string]any)
+		if !ok {
+			t.Fatalf("peer entry has type %T, want map[string]any", rawPeer)
+		}
+
+		id, ok := peer["id"].(string)
+		if !ok || id == "" {
+			t.Fatalf("peer id = %#v, want non-empty string", peer["id"])
+		}
+		gotIDs[id] = struct{}{}
+
+		methods, ok := peer["methods"].([]any)
+		if !ok {
+			t.Fatalf("peer methods has type %T, want []any", peer["methods"])
+		}
+		if len(methods) != 0 {
+			t.Fatalf("peer methods = %#v, want empty list", methods)
+		}
+	}
+
+	for id := range wantIDs {
+		if _, ok := gotIDs[id]; !ok {
+			t.Fatalf("rpc.peers missing connected client id %q in %#v", id, gotIDs)
+		}
+	}
+}
+
 func TestHolonRPCNotification(t *testing.T) {
 	called := make(chan struct{}, 1)
 	_, addr := startHolonRPCServer(t, func(s *holonrpc.Server) {
