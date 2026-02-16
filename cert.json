@@ -21,7 +21,9 @@
   },
   "executables": {
     "echo_client": "go run ./cmd/echo-client",
-    "echo_server": "go run ./cmd/echo-server"
+    "echo_server": "go run ./cmd/echo-server",
+    "accum_client": "go run ./cmd/accum-client",
+    "accum_server": "go run ./cmd/accum-server"
   },
   "lang": "go",
   "last_certified": {
